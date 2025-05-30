@@ -104,10 +104,10 @@ From your activated environment, use:
 
 ```bash
 # Basic CSV processing, save everything locally:
-python run.py path/to/data.csv
+python run.py "path/to/data.csv"
 
 # Basic image processing:
-python run.py path/to/image.png
+python run.py "path/to/image.png"
 
 # Include min trace length (default 30):
 python run.py data.csv --min_trace_length=50
