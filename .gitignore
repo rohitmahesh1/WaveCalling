@@ -14,3 +14,5 @@ token.pickle
 # OS / editor
 .DS_Store
 
+# ignore Excel sample files
+*.xls
