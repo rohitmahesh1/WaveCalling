@@ -1,0 +1,16 @@
+# virtual‐env
+waves/
+
+# models
+models/
+
+# compiled Python
+__pycache__/
+
+# credentials & tokens
+*.json
+token.pickle
+
+# OS / editor
+.DS_Store
+
