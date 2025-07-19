@@ -16,3 +16,6 @@ token.pickle
 
 # ignore Excel sample files
 *.xls
+
+# ignore TODO.md, only in dev
+TODO.md
