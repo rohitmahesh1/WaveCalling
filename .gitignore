@@ -16,3 +16,6 @@ token.pickle
 
 # ignore Excel sample files
 *.xls
+
+# exclude legacy-files
+legacy-files
