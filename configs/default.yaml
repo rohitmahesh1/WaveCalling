@@ -1,0 +1,28 @@
+# Default configuration for the kymograph PoC pipeline
+
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+
+io:
+  sampling_rate: 5.0 
+  image_globs: ["*.png", "*.jpg", "*.jpeg"]
+  track_glob: "*.npy"
+
+# --- Detrending (baseline removal) ---
+detrend:
+  degree: 1              # 1=linear, 2=quadratic (surf waves may benefit from 2)
+  min_samples: 0.5       # RANSAC: proportion or absolute count
+  residual_threshold: null  # if null, computed from MAD of y
+  random_state: 42
+
+# --- Peak detection (bulges/spikes) ---
+peaks:
+  prominence: 3.0  # increase to ignore small fluctuations
+  width: 2         # in samples; tune to expected bulge width
+  distance: 8      # min samples between peaks to avoid double-counting
+
+# --- Global periodicity estimation ---
+period:
+  sampling_rate: 5.0  # should match io.sampling_rate 
+  min_freq: 0.02      # Hz (or cycles per frame if sampling_rate=1)
+  max_freq: 2.0       # upper bound to avoid picking noise
