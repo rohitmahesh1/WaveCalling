@@ -1,16 +1,18 @@
 import argparse
-import yaml
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# import kymo interface
-from kymo_interface import run_kymobutler, preprocess_image
+# kymo interface (Mathematica/WolframScript wrappers)
+from kymo_interface import run_kymobutler
 
-# import signal modules
+# signal-processing modules (package-relative)
 from .signal.detrend import detrend_residual
-from .signal.peaks import detect_peaks, peaks_to_dataframe
+from .signal.peaks import detect_peaks
 from .signal.period import estimate_dominant_frequency, frequency_to_period
+
+# utilities
+from .utils import setup_logging, get_logger, load_config, list_files, save_dataframe
 
 
 def process_track(
@@ -31,10 +33,10 @@ def process_track(
     # detrend
     residual = detrend_residual(x, y, **detrend_cfg)
 
-    # detect peaks
+    # detect peaks on residual
     peaks_idx, props = detect_peaks(residual, **peaks_cfg)
 
-    # global frequency
+    # global frequency and period
     freq = estimate_dominant_frequency(residual, **period_cfg)
     period = frequency_to_period(freq)
 
@@ -42,7 +44,7 @@ def process_track(
 
     return {
         'track': arr_path.stem,
-        'num_peaks': len(peaks_idx),
+        'num_peaks': int(len(peaks_idx)),
         'mean_amplitude': float(np.mean(amps)) if amps.size > 0 else float('nan'),
         'median_amplitude': float(np.median(amps)) if amps.size > 0 else float('nan'),
         'std_amplitude': float(np.std(amps)) if amps.size > 0 else float('nan'),
@@ -53,7 +55,7 @@ def process_track(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract wave characteristics from kymobutler outputs"
+        description="Extract wave characteristics from KymoButler outputs"
     )
     parser.add_argument(
         '--input-dir', '-i', required=True,
@@ -72,46 +74,66 @@ def main():
     )
     args = parser.parse_args()
 
-    # load config
-    with open(args.config, 'r') as f:
-        cfg = yaml.safe_load(f)
+    # load config & set up logging
+    cfg = load_config(args.config)
+    log_level = cfg.get('logging', {}).get('level', 'INFO')
+    setup_logging(log_level)
+    log = get_logger(__name__)
+    if args.verbose:
+        log.setLevel('DEBUG')
+
+    # configs
+    io_cfg = cfg.get('io', {})
+    image_globs = io_cfg.get('image_globs', ['*.png', '*.jpg', '*.jpeg'])
+    track_glob = io_cfg.get('track_glob', '*.npy')
 
     detrend_cfg = cfg.get('detrend', {})
     peaks_cfg = cfg.get('peaks', {})
-    period_cfg = cfg.get('period', {})
+    period_cfg = cfg.get('period', {}).copy()
+    # ensure sampling_rate present for period estimation
+    period_cfg.setdefault('sampling_rate', io_cfg.get('sampling_rate', 1.0))
 
     input_path = Path(args.input_dir)
     results = []
 
-    # find all heatmap images or .npy files
-    # if .npy files present, skip kymobutler run
-    npy_files = list(input_path.rglob('*.npy'))
+    # discover existing track arrays
+    npy_files = list(input_path.rglob(track_glob))
     if npy_files:
-        if args.verbose:
-            print(f'Found {len(npy_files)} .npy files; skipping KymoButler run')
-        arr_paths = npy_files
+        log.info(f'Found {len(npy_files)} existing track arrays; skipping KymoButler run')
+        arr_paths = sorted(npy_files)
     else:
-        # run kymobutler on each image
-        img_files = list(input_path.rglob('*.png')) + list(input_path.rglob('*.jpg'))
-        if args.verbose:
-            print(f'Found {len(img_files)} images; running KymoButler...')
+        # gather images and run KymoButler per image
+        img_files = list_files(input_path, image_globs)
+        if not img_files:
+            log.error('No images or track arrays found under input directory')
+            raise SystemExit(2)
+        log.info(f'Found {len(img_files)} images; running KymoButler...')
         arr_paths = []
         for img in img_files:
+            log.debug(f'Running KymoButler on {img}...')
             base_dir = run_kymobutler(img, verbose=args.verbose)
             out_dir = base_dir / 'kymobutler_output'
-            arr_paths += list(out_dir.glob('*.npy'))
+            found = sorted(out_dir.glob(track_glob))
+            log.debug(f"{img.name}: found {len(found)} tracks")
+            arr_paths.extend(found)
+
+    if not arr_paths:
+        log.error('No track arrays (.npy) found after processing')
+        raise SystemExit(2)
 
     # process each track array
     for arr in arr_paths:
-        if args.verbose:
-            print(f'Processing track {arr.name}...')
-        metrics = process_track(arr, detrend_cfg, peaks_cfg, period_cfg)
-        results.append(metrics)
+        log.debug(f'Processing track {arr.name}...')
+        try:
+            metrics = process_track(arr, detrend_cfg, peaks_cfg, period_cfg)
+            results.append(metrics)
+        except Exception as e:
+            log.exception(f'Failed on {arr}: {e}')
 
     # write results
     df = pd.DataFrame(results)
-    df.to_csv(args.output_csv, index=False)
-    print(f"Metrics saved to {args.output_csv}")
+    save_dataframe(df, args.output_csv)
+    log.info(f"Metrics saved to {args.output_csv}")
 
 
 if __name__ == '__main__':
