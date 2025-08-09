@@ -39,6 +39,7 @@ def process_track(
     sampling_rate: float | None = None,
     make_plot_detrended: bool = True,
     make_plot_spectrum: bool = True,
+    dpi: int | None = None,
     log=None,
 ) -> dict:
     """
@@ -79,6 +80,7 @@ def process_track(
                     degree=int(detrend_cfg.get('degree', 1)),
                     ransac_kwargs=ransac_kwargs,
                     title=f'{arr_path.stem}',
+                    dpi=dpi,
                 )
             except Exception as e:
                 if log:
@@ -91,6 +93,7 @@ def process_track(
                     sampling_rate,
                     track_dir / 'spectrum.png',
                     title=f'{arr_path.stem} spectrum',
+                    dpi=dpi,
                 )
             except Exception as e:
                 if log:
@@ -161,6 +164,7 @@ def main():
     summary_cfg = viz_cfg.get('summary', {})
     make_summary_hists = bool(summary_cfg.get('histograms', True))
     hist_bins = int(viz_cfg.get('hist_bins', 20))
+    dpi = int(viz_cfg.get('dpi', 180))
 
     input_path = Path(args.input_dir)
     results = []
@@ -212,6 +216,7 @@ def main():
                 sampling_rate=sampling_rate,
                 make_plot_detrended=make_plot_detrended,
                 make_plot_spectrum=make_plot_spectrum,
+                dpi=dpi,
                 log=log,
             )
             results.append(metrics)
@@ -225,7 +230,7 @@ def main():
 
     # summary plots (honor viz toggles)
     if plots_dir is not None and make_summary_hists:
-        plot_summary_histograms(df, plots_dir, bins=hist_bins)
+        plot_summary_histograms(df, plots_dir, bins=hist_bins, dpi=dpi)
         log.info(f"Summary plots saved under {plots_dir}")
 
 
