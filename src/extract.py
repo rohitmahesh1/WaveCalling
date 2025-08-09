@@ -37,6 +37,8 @@ def process_track(
     *,
     plots_dir: Path | None = None,
     sampling_rate: float | None = None,
+    make_plot_detrended: bool = True,
+    make_plot_spectrum: bool = True,
     log=None,
 ) -> dict:
     """
@@ -62,26 +64,27 @@ def process_track(
 
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
 
-    # optional plotting
+    # optional plotting controlled by viz toggles
     if plots_dir is not None:
         track_dir = ensure_dir(Path(plots_dir) / arr_path.stem)
         # Baseline + residual + peaks (re-fit baseline just for overlay consistency)
-        try:
-            ransac_kwargs = {k: v for k, v in detrend_cfg.items() if k != 'degree'}
-            plot_detrended_with_peaks(
-                x,
-                y,
-                peaks_idx,
-                track_dir / 'detrended_with_peaks.png',
-                degree=int(detrend_cfg.get('degree', 1)),
-                ransac_kwargs=ransac_kwargs,
-                title=f'{arr_path.stem}',
-            )
-        except Exception as e:
-            if log:
-                log.debug(f'Plot detrended_with_peaks failed for {arr_path.name}: {e}')
+        if make_plot_detrended:
+            try:
+                ransac_kwargs = {k: v for k, v in detrend_cfg.items() if k != 'degree'}
+                plot_detrended_with_peaks(
+                    x,
+                    y,
+                    peaks_idx,
+                    track_dir / 'detrended_with_peaks.png',
+                    degree=int(detrend_cfg.get('degree', 1)),
+                    ransac_kwargs=ransac_kwargs,
+                    title=f'{arr_path.stem}',
+                )
+            except Exception as e:
+                if log:
+                    log.debug(f'Plot detrended_with_peaks failed for {arr_path.name}: {e}')
         # Spectrum
-        if sampling_rate is not None:
+        if make_plot_spectrum and (sampling_rate is not None):
             try:
                 plot_spectrum(
                     residual,
@@ -149,14 +152,27 @@ def main():
     sampling_rate = io_cfg.get('sampling_rate', 1.0)
     period_cfg.setdefault('sampling_rate', sampling_rate)
 
+    # viz toggles
+    viz_cfg = cfg.get('viz', {})
+    viz_enabled = bool(viz_cfg.get('enabled', True))
+    per_track_cfg = viz_cfg.get('per_track', {})
+    make_plot_detrended = bool(per_track_cfg.get('detrended_with_peaks', True))
+    make_plot_spectrum = bool(per_track_cfg.get('spectrum', True))
+    summary_cfg = viz_cfg.get('summary', {})
+    make_summary_hists = bool(summary_cfg.get('histograms', True))
+    hist_bins = int(viz_cfg.get('hist_bins', 20))
+
     input_path = Path(args.input_dir)
     results = []
 
-    # determine plotting
+    # determine plotting directory (requires CLI flag and viz.enabled)
     plots_dir = None
     if args.plots_out:
-        plots_dir = ensure_dir(args.plots_out)
-        log.info(f'Plot outputs will be written to {plots_dir}')
+        if viz_enabled:
+            plots_dir = ensure_dir(args.plots_out)
+            log.info(f'Plot outputs will be written to {plots_dir}')
+        else:
+            log.info('viz.enabled is False in config; skipping plot generation despite --plots-out')
 
     # discover existing track arrays
     npy_files = list(input_path.rglob(track_glob))
@@ -194,6 +210,8 @@ def main():
                 period_cfg,
                 plots_dir=plots_dir,
                 sampling_rate=sampling_rate,
+                make_plot_detrended=make_plot_detrended,
+                make_plot_spectrum=make_plot_spectrum,
                 log=log,
             )
             results.append(metrics)
@@ -205,9 +223,9 @@ def main():
     save_dataframe(df, args.output_csv)
     log.info(f"Metrics saved to {args.output_csv}")
 
-    # summary plots
-    if plots_dir is not None:
-        plot_summary_histograms(df, plots_dir)
+    # summary plots (honor viz toggles)
+    if plots_dir is not None and make_summary_hists:
+        plot_summary_histograms(df, plots_dir, bins=hist_bins)
         log.info(f"Summary plots saved under {plots_dir}")
 
 
