@@ -23,7 +23,8 @@ def plot_track(
     save_path: Path | str,
     *,
     title: str | None = None,
-    show: bool = False
+    show: bool = False,
+    dpi: int | None = None,
 ) -> Path:
     """Simple plot of raw track (y vs x)."""
     save_path = _ensure_parent(save_path)
@@ -34,7 +35,7 @@ def plot_track(
     if title:
         plt.title(title)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
+    plt.savefig(save_path, dpi=(dpi if dpi is not None else 180))
     if show:
         plt.show()
     plt.close()
@@ -50,7 +51,8 @@ def plot_detrended_with_peaks(
     degree: int = 1,
     ransac_kwargs: Optional[dict] = None,
     title: Optional[str] = None,
-    show: bool = False
+    show: bool = False,
+    dpi: int | None = None,
 ) -> Path:
     """
     Plot raw y, robust baseline (RANSAC poly), residual, and mark peaks.
@@ -91,7 +93,7 @@ def plot_detrended_with_peaks(
     if title:
         plt.title(title)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
+    plt.savefig(save_path, dpi=(dpi if dpi is not None else 180))
     if show:
         plt.show()
     plt.close()
@@ -104,7 +106,8 @@ def plot_spectrum(
     save_path: Path | str,
     *,
     title: Optional[str] = None,
-    show: bool = False
+    show: bool = False,
+    dpi: int | None = None,
 ) -> Path:
     """Plot single-sided magnitude spectrum of residual."""
     save_path = _ensure_parent(save_path)
@@ -121,7 +124,7 @@ def plot_spectrum(
     if title:
         plt.title(title)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
+    plt.savefig(save_path, dpi=(dpi if dpi is not None else 180))
     if show:
         plt.show()
     plt.close()
@@ -133,7 +136,8 @@ def plot_summary_histograms(
     save_dir: Path | str,
     *,
     bins: int = 20,
-    show: bool = False
+    show: bool = False,
+    dpi: int | None = None,
 ) -> dict[str, Path]:
     """
     Plot histograms for key metrics in the aggregated output CSV.
@@ -161,7 +165,7 @@ def plot_summary_histograms(
             plt.ylabel("Count")
             plt.title(f"Distribution of {label}")
         plt.tight_layout()
-        plt.savefig(fig_path, dpi=160)
+        plt.savefig(fig_path, dpi=(dpi if dpi is not None else 160))
         if show:
             plt.show()
         plt.close()
