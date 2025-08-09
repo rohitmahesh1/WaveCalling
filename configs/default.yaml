@@ -4,7 +4,7 @@ logging:
   level: INFO  # DEBUG, INFO, WARNING, ERROR
 
 io:
-  sampling_rate: 5.0 
+  sampling_rate: 5.0  # frames per second 
   image_globs: ["*.png", "*.jpg", "*.jpeg"]
   track_glob: "*.npy"
 
@@ -23,6 +23,17 @@ peaks:
 
 # --- Global periodicity estimation ---
 period:
-  sampling_rate: 5.0  # should match io.sampling_rate 
+  sampling_rate: 5.0  # should match io.sampling_rate
   min_freq: 0.02      # Hz (or cycles per frame if sampling_rate=1)
   max_freq: 2.0       # upper bound to avoid picking noise
+
+# --- Visualization controls ---
+viz:
+  enabled: true            
+  per_track:
+    detrended_with_peaks: true
+    spectrum: true
+  summary:
+    histograms: true
+  hist_bins: 20           # bins for summary histograms
+  dpi: 180                # dpi for saved figures
