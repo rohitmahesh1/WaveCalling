@@ -11,18 +11,38 @@ from .signal.detrend import detrend_residual
 from .signal.peaks import detect_peaks
 from .signal.period import estimate_dominant_frequency, frequency_to_period
 
+# visualization
+from .visualize import (
+    plot_detrended_with_peaks,
+    plot_spectrum,
+    plot_summary_histograms,
+)
+
 # utilities
-from .utils import setup_logging, get_logger, load_config, list_files, save_dataframe
+from .utils import (
+    setup_logging,
+    get_logger,
+    load_config,
+    list_files,
+    save_dataframe,
+    ensure_dir,
+)
 
 
 def process_track(
     arr_path: Path,
     detrend_cfg: dict,
     peaks_cfg: dict,
-    period_cfg: dict
+    period_cfg: dict,
+    *,
+    plots_dir: Path | None = None,
+    sampling_rate: float | None = None,
+    log=None,
 ) -> dict:
     """
-    Load a track (.npy), compute residual, detect peaks, and estimate frequency.
+    Load a track (.npy), compute residual, detect peaks, estimate frequency,
+    and optionally save diagnostic plots.
+
     Returns a dict of track-level metrics.
     """
     data = np.load(arr_path)
@@ -34,13 +54,44 @@ def process_track(
     residual = detrend_residual(x, y, **detrend_cfg)
 
     # detect peaks on residual
-    peaks_idx, props = detect_peaks(residual, **peaks_cfg)
+    peaks_idx, _ = detect_peaks(residual, **peaks_cfg)
 
     # global frequency and period
     freq = estimate_dominant_frequency(residual, **period_cfg)
     period = frequency_to_period(freq)
 
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
+
+    # optional plotting
+    if plots_dir is not None:
+        track_dir = ensure_dir(Path(plots_dir) / arr_path.stem)
+        # Baseline + residual + peaks (re-fit baseline just for overlay consistency)
+        try:
+            ransac_kwargs = {k: v for k, v in detrend_cfg.items() if k != 'degree'}
+            plot_detrended_with_peaks(
+                x,
+                y,
+                peaks_idx,
+                track_dir / 'detrended_with_peaks.png',
+                degree=int(detrend_cfg.get('degree', 1)),
+                ransac_kwargs=ransac_kwargs,
+                title=f'{arr_path.stem}',
+            )
+        except Exception as e:
+            if log:
+                log.debug(f'Plot detrended_with_peaks failed for {arr_path.name}: {e}')
+        # Spectrum
+        if sampling_rate is not None:
+            try:
+                plot_spectrum(
+                    residual,
+                    sampling_rate,
+                    track_dir / 'spectrum.png',
+                    title=f'{arr_path.stem} spectrum',
+                )
+            except Exception as e:
+                if log:
+                    log.debug(f'Plot spectrum failed for {arr_path.name}: {e}')
 
     return {
         'track': arr_path.stem,
@@ -49,7 +100,7 @@ def process_track(
         'median_amplitude': float(np.median(amps)) if amps.size > 0 else float('nan'),
         'std_amplitude': float(np.std(amps)) if amps.size > 0 else float('nan'),
         'dominant_frequency': float(freq),
-        'period': float(period)
+        'period': float(period),
     }
 
 
@@ -68,6 +119,10 @@ def main():
     parser.add_argument(
         '--output-csv', '-o', required=True,
         help='Path to write master CSV of track metrics'
+    )
+    parser.add_argument(
+        '--plots-out', type=str, default=None,
+        help='Directory to save plots (per-track and summary). If omitted, no plots are generated.'
     )
     parser.add_argument(
         '--verbose', '-v', action='store_true', help='Verbose logging'
@@ -91,10 +146,17 @@ def main():
     peaks_cfg = cfg.get('peaks', {})
     period_cfg = cfg.get('period', {}).copy()
     # ensure sampling_rate present for period estimation
-    period_cfg.setdefault('sampling_rate', io_cfg.get('sampling_rate', 1.0))
+    sampling_rate = io_cfg.get('sampling_rate', 1.0)
+    period_cfg.setdefault('sampling_rate', sampling_rate)
 
     input_path = Path(args.input_dir)
     results = []
+
+    # determine plotting
+    plots_dir = None
+    if args.plots_out:
+        plots_dir = ensure_dir(args.plots_out)
+        log.info(f'Plot outputs will be written to {plots_dir}')
 
     # discover existing track arrays
     npy_files = list(input_path.rglob(track_glob))
@@ -125,7 +187,15 @@ def main():
     for arr in arr_paths:
         log.debug(f'Processing track {arr.name}...')
         try:
-            metrics = process_track(arr, detrend_cfg, peaks_cfg, period_cfg)
+            metrics = process_track(
+                arr,
+                detrend_cfg,
+                peaks_cfg,
+                period_cfg,
+                plots_dir=plots_dir,
+                sampling_rate=sampling_rate,
+                log=log,
+            )
             results.append(metrics)
         except Exception as e:
             log.exception(f'Failed on {arr}: {e}')
@@ -134,6 +204,11 @@ def main():
     df = pd.DataFrame(results)
     save_dataframe(df, args.output_csv)
     log.info(f"Metrics saved to {args.output_csv}")
+
+    # summary plots
+    if plots_dir is not None:
+        plot_summary_histograms(df, plots_dir)
+        log.info(f"Summary plots saved under {plots_dir}")
 
 
 if __name__ == '__main__':
