@@ -1,22 +1,64 @@
 from pathlib import Path
 import os
+import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Tuple
 
 
+def _is_xlsx_magic(header: bytes) -> bool:
+    # XLSX files are ZIP archives; ZIP magic is PK\x03\x04
+    return header.startswith(b"PK\x03\x04")
+
+
+def _is_xls_magic(header: bytes) -> bool:
+    # Legacy Excel (.xls OLE) magic: D0 CF 11 E0 A1 B1 1A E1
+    return header.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")
+
+
 def _load_table(path: Path) -> pd.DataFrame:
-    ext = path.suffix.lower()
-    if ext in (".csv",):
-        return pd.read_csv(path, header=None)
-    if ext in (".tsv",):
+    """
+    Load a tabular file robustly:
+    - If true XLSX (ZIP magic): use openpyxl engine.
+    - If true XLS (OLE magic): try xlrd engine.
+    - Otherwise: treat as text and let pandas sniff the delimiter.
+    This handles mislabeled files (e.g., CSV named .xls).
+    """
+    # Read a small header to sniff actual format
+    with open(path, "rb") as f:
+        header = f.read(8)
+
+    # True XLSX
+    if _is_xlsx_magic(header):
+        try:
+            return pd.read_excel(path, header=None, engine="openpyxl")
+        except ImportError as e:
+            raise RuntimeError(
+                "Tried to read an .xlsx Excel file but 'openpyxl' is not installed. "
+                "Install it with: pip install openpyxl"
+            ) from e
+
+    # True XLS
+    if _is_xls_magic(header):
+        try:
+            return pd.read_excel(path, header=None, engine="xlrd")
+        except ImportError as e:
+            raise RuntimeError(
+                "Tried to read a legacy .xls Excel file but 'xlrd' is not installed. "
+                "Install it with: pip install xlrd"
+            ) from e
+        except ValueError:
+            # Some corrupt/odd .xls — fall back to text
+            pass
+
+    # Text table (CSV/TSV or mislabeled Excel)
+    # Use sep=None to let pandas sniff the delimiter (requires python engine)
+    try:
+        return pd.read_csv(path, sep=None, engine="python", header=None)
+    except Exception:
+        # One more attempt: assume TSV
         return pd.read_csv(path, sep="\t", header=None)
-    if ext in (".xls", ".xlsx"):
-        # read the first sheet by default; no header
-        return pd.read_excel(path, header=None)
-    # fallback: try CSV
-    return pd.read_csv(path, header=None)
 
 
 def _keep_extremes_zero_middle(arr: np.ndarray, lower: float, upper: float) -> np.ndarray:
