@@ -19,3 +19,6 @@ token.pickle
 
 # exclude legacy-files
 legacy-files
+
+# ignore data/
+data/
