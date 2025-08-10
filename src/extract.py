@@ -14,6 +14,7 @@ from .signal.period import estimate_dominant_frequency, frequency_to_period
 # visualization
 from .visualize import (
     plot_detrended_with_peaks,
+    plot_peak_windows,
     plot_spectrum,
     plot_summary_histograms,
 )
@@ -87,6 +88,20 @@ def process_track(
                     overlay_fit=True,
                     sampling_rate=sampling_rate,
                     freq=freq,
+                )
+                if sampling_rate is not None and freq is not None and freq > 0:
+                    plot_peak_windows(
+                        x, y, peaks_idx,
+                        (track_dir / "peak_windows"),
+                        degree=int(detrend_cfg.get('degree', 1)),
+                        ransac_kwargs=ransac_kwargs,
+                        sampling_rate=sampling_rate,
+                        freq=freq,
+                        period_frac=0.5,   # show 0.5 of a period centered on each peak
+                        max_plots=12,      # cap to avoid huge directories
+                        dpi=dpi,
+                        title_prefix=arr_path.stem,
+                        overlay_fit=True,
                 )
             except Exception as e:
                 if log:
