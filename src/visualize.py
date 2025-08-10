@@ -55,10 +55,8 @@ def plot_detrended_with_peaks(
     dpi: int | None = None,
 ) -> Path:
     """
-    Plot raw y, robust baseline (RANSAC poly), residual, and mark peaks.
-
-    If you already have a residual, you can pass y as the residual and set
-    ransac_kwargs={'skip_baseline': True} to disable baseline overlay.
+    Plot raw y, robust baseline (RANSAC poly), residual, and mark peaks,
+    with axes flipped so X = position, Y = time.
     """
     save_path = _ensure_parent(save_path)
     ransac_kwargs = ransac_kwargs or {}
@@ -76,19 +74,21 @@ def plot_detrended_with_peaks(
         residual = y - baseline
 
     plt.figure(figsize=(8, 5))
-    # raw and baseline
+    
+    # raw and baseline (axes flipped)
     if not skip_baseline:
-        plt.plot(x, y, linewidth=1, label="raw")
-        plt.plot(x, baseline, linewidth=1, linestyle="--", label="baseline")
-    # residual
-    plt.plot(x, residual, linewidth=1, label="residual")
+        plt.plot(y, x, linewidth=1, label="raw")
+        plt.plot(baseline, x, linewidth=1, linestyle="--", label="baseline")
+    
+    # residual (axes flipped)
+    plt.plot(residual, x, linewidth=1, label="residual")
 
     peaks_idx = np.asarray(list(peaks_idx), dtype=int)
     if peaks_idx.size:
-        plt.scatter(x[peaks_idx], residual[peaks_idx], s=20, label="peaks")
+        plt.scatter(residual[peaks_idx], x[peaks_idx], s=20, label="peaks")
 
-    plt.xlabel("x")
-    plt.ylabel("value")
+    plt.xlabel("Position")
+    plt.ylabel("Time")
     plt.legend()
     if title:
         plt.title(title)
