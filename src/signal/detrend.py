@@ -1,5 +1,7 @@
+import warnings
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.linear_model import RANSACRegressor, LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import Pipeline
@@ -49,6 +51,7 @@ def fit_baseline_ransac(
     """
     x = np.asarray(x)
     y = np.asarray(y)
+    n = len(x)
 
     # Default residual threshold = MAD(y); fallback to 0.5*std if MAD==0
     if residual_threshold is None:
@@ -58,9 +61,17 @@ def fit_baseline_ransac(
             rt = 0.5 * s if s > 0 else 1.0
         residual_threshold = float(rt)
 
+    # Compute a safe integer min_samples
+    if isinstance(min_samples, float):
+        ms = int(np.ceil(min_samples * n))
+    else:
+        ms = int(min_samples)
+    ms = max(ms, degree + 1, 2)       # at least 2 points, and enough for the polynomial
+    ms = min(ms, n)                   # cannot exceed available samples
+
     ransac = _make_ransac(
         LinearRegression(),
-        min_samples=min_samples,
+        min_samples=ms,
         residual_threshold=residual_threshold,
         random_state=random_state,
     )
@@ -70,11 +81,14 @@ def fit_baseline_ransac(
         ("ransac", ransac),
     ])
 
-    # If RANSAC fails (too few inliers, etc.), fall back to plain poly LSQ
+    # Suppress the benign R^2<2 samples warnings during RANSAC scoring
     try:
-        model.fit(x.reshape(-1, 1), y)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+            model.fit(x.reshape(-1, 1), y)
         return model
     except Exception:
+        # Fall back to plain polynomial LSQ if RANSAC can't find a good set
         return _fit_poly_baseline(x, y, degree)
 
 
