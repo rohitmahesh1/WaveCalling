@@ -84,6 +84,9 @@ def process_track(
                     ransac_kwargs=ransac_kwargs,
                     title=f'{arr_path.stem}',
                     dpi=dpi,
+                    overlay_fit=True,
+                    sampling_rate=sampling_rate,
+                    freq=freq,
                 )
             except Exception as e:
                 if log:
