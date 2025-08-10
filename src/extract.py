@@ -220,8 +220,16 @@ def main():
                     generated_imgs.append(out_img)
                 except Exception as e:
                     log.exception(f'Heatmap generation failed for {tbl}: {e}')
-        # combine
+
         all_images = list(map(Path, img_files)) + generated_imgs
+
+        # filter out KymoButler visualization outputs
+        def _is_overlay(p: Path) -> bool:
+            s = str(p)
+            return s.endswith("_overlay.png") or s.endswith("_overlay.jpg") or "_output/" in s or s.endswith("_output")
+
+        all_images = [p for p in all_images if not _is_overlay(p)]
+
         if not all_images:
             log.error('No images, tables, or track arrays found under input directory')
             raise SystemExit(2)
