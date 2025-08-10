@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,100 @@ def plot_track(
         plt.show()
     plt.close()
     return save_path
+
+
+def plot_peak_windows(
+    x: np.ndarray,
+    y: np.ndarray,
+    peaks_idx: Iterable[int],
+    save_dir: Path | str,
+    *,
+    degree: int = 1,
+    ransac_kwargs: Optional[dict] = None,
+    sampling_rate: float | None = None,
+    freq: float | None = None,
+    period_frac: float = 0.5,     # fraction of ONE period to show (total width)
+    max_plots: int = 12,          # avoid hundreds of files
+    dpi: int | None = None,
+    title_prefix: Optional[str] = None,
+    overlay_fit: bool = True,
+) -> List[Path]:
+    """
+    For each peak, plot a window of width = period_frac * period centered on that peak.
+    Overlays baseline, residual, peak marker, and (optionally) baseline+sine fit.
+    Returns the list of saved file paths.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+    peaks_idx = np.asarray(list(peaks_idx), dtype=int)
+    if peaks_idx.size == 0:
+        return []
+
+    # Fit baseline once; compute residual once
+    ransac_kwargs = (ransac_kwargs or {}).copy()
+    skip_baseline = ransac_kwargs.pop("skip_baseline", False)
+    if skip_baseline:
+        baseline = np.zeros_like(y)
+        residual = y
+    else:
+        model = fit_baseline_ransac(x, y, degree=degree, **ransac_kwargs)
+        baseline = model.predict(x.reshape(-1, 1))
+        residual = y - baseline
+
+    # If we can, precompute the global sine fit over the full signal
+    yfit_res = None
+    if overlay_fit and sampling_rate and freq and freq > 0:
+        from .visualize import _fit_global_sine  # local import to avoid cycles
+        yfit_res, _, _, _ = _fit_global_sine(residual, x, sampling_rate, freq)
+
+    # How many frames correspond to one period?
+    if sampling_rate and freq and freq > 0:
+        frames_per_period = sampling_rate / float(freq)
+    else:
+        # Fallback: a modest fixed window if frequency is unknown
+        frames_per_period = 40.0
+
+    half_span = max(1, int(round((period_frac * frames_per_period) / 2.0)))
+
+    saved: List[Path] = []
+    for j, pk in enumerate(peaks_idx[:max_plots]):
+        lo = max(0, int(pk) - half_span)
+        hi = min(len(x) - 1, int(pk) + half_span)
+
+        xs = x[lo:hi + 1]
+        raw = y[lo:hi + 1]
+        base = baseline[lo:hi + 1]
+        res = residual[lo:hi + 1]
+        yfit_seg = None
+        if yfit_res is not None:
+            yfit_seg = (baseline + yfit_res)[lo:hi + 1]
+
+        # Plot with axes flipped (X=position, Y=time)
+        plt.figure(figsize=(6, 4))
+        plt.plot(raw, xs, linewidth=1, label="raw")
+        plt.plot(base, xs, linewidth=1, linestyle="--", label="baseline")
+        plt.plot(res, xs, linewidth=1, label="residual")
+        # peak marker (at residual value)
+        plt.scatter(residual[pk], x[pk], s=25, label="peak")
+        if yfit_seg is not None:
+            plt.plot(yfit_seg, xs, linewidth=1.2, alpha=0.95, label=f"sine fit")
+
+        plt.xlabel("Position")
+        plt.ylabel("Time")
+        ttl = f"{title_prefix or 'track'} – peak {j} @ idx {int(pk)}"
+        plt.title(ttl)
+        plt.legend()
+        plt.tight_layout()
+
+        out = save_dir / f"peak_{j:03d}_window.png"
+        plt.savefig(out, dpi=(dpi if dpi is not None else 180))
+        plt.close()
+        saved.append(out)
+
+    return saved
 
 
 def _fit_global_sine(residual: np.ndarray,
