@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Union
 
 # Directory containing the Mathematica/WolframScript kymobutler scripts
-SCRIPT_DIR = Path(__file__).parent / "kymobutler_scripts"
+SCRIPT_DIR = Path(__file__).resolve().parent.parent / "kymobutler_scripts"
 
 
 def run_kymobutler(
