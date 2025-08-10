@@ -18,6 +18,9 @@ from .visualize import (
     plot_summary_histograms,
 )
 
+# I/O for tables → heatmaps
+from .io.table_to_heatmap import table_to_heatmap
+
 # utilities
 from .utils import (
     setup_logging,
@@ -116,7 +119,7 @@ def main():
     )
     parser.add_argument(
         '--input-dir', '-i', required=True,
-        help='Directory containing kymograph images (or .npy outputs)'
+        help='Directory containing kymograph images, tables (csv/tsv/xls/xlsx), or .npy outputs'
     )
     parser.add_argument(
         '--config', '-c', required=True,
@@ -147,6 +150,7 @@ def main():
     io_cfg = cfg.get('io', {})
     image_globs = io_cfg.get('image_globs', ['*.png', '*.jpg', '*.jpeg'])
     track_glob = io_cfg.get('track_glob', '*.npy')
+    table_globs = io_cfg.get('table_globs', ['*.csv', '*.tsv', '*.xls', '*.xlsx'])
 
     detrend_cfg = cfg.get('detrend', {})
     peaks_cfg = cfg.get('peaks', {})
@@ -154,6 +158,14 @@ def main():
     # ensure sampling_rate present for period estimation
     sampling_rate = io_cfg.get('sampling_rate', 1.0)
     period_cfg.setdefault('sampling_rate', sampling_rate)
+
+    # heatmap params (for tables → images)
+    heatmap_cfg = cfg.get('heatmap', {})
+    hm_lower = float(heatmap_cfg.get('lower', -1e20))
+    hm_upper = float(heatmap_cfg.get('upper', 1e16))
+    hm_binarize = bool(heatmap_cfg.get('binarize', True))
+    hm_origin = str(heatmap_cfg.get('origin', 'lower'))
+    hm_cmap = str(heatmap_cfg.get('cmap', 'hot'))
 
     # viz toggles
     viz_cfg = cfg.get('viz', {})
@@ -178,25 +190,50 @@ def main():
         else:
             log.info('viz.enabled is False in config; skipping plot generation despite --plots-out')
 
-    # discover existing track arrays
+    # discover existing track arrays first
     npy_files = list(input_path.rglob(track_glob))
     if npy_files:
         log.info(f'Found {len(npy_files)} existing track arrays; skipping KymoButler run')
         arr_paths = sorted(npy_files)
     else:
-        # gather images and run KymoButler per image
+        # gather images from disk
         img_files = list_files(input_path, image_globs)
-        if not img_files:
-            log.error('No images or track arrays found under input directory')
+
+        # gather tables and convert to heatmaps
+        table_files = list_files(input_path, table_globs)
+        generated_imgs = []
+        if table_files:
+            out_dir = ensure_dir(input_path / 'generated_heatmaps')
+            log.info(f'Converting {len(table_files)} table(s) to heatmaps → {out_dir}')
+            for tbl in table_files:
+                try:
+                    out_img, _, _ = table_to_heatmap(
+                        tbl,
+                        out_dir=out_dir,
+                        lower=hm_lower,
+                        upper=hm_upper,
+                        binarize=hm_binarize,
+                        origin=hm_origin,
+                        cmap=hm_cmap,
+                        dpi=dpi,
+                    )
+                    generated_imgs.append(out_img)
+                except Exception as e:
+                    log.exception(f'Heatmap generation failed for {tbl}: {e}')
+        # combine
+        all_images = list(map(Path, img_files)) + generated_imgs
+        if not all_images:
+            log.error('No images, tables, or track arrays found under input directory')
             raise SystemExit(2)
-        log.info(f'Found {len(img_files)} images; running KymoButler...')
+
+        log.info(f'Found {len(all_images)} images total; running KymoButler...')
         arr_paths = []
-        for img in img_files:
+        for img in all_images:
             log.debug(f'Running KymoButler on {img}...')
-            base_dir = run_kymobutler(img, verbose=args.verbose)
+            base_dir = run_kymobutler(str(img), verbose=args.verbose)
             out_dir = base_dir / 'kymobutler_output'
             found = sorted(out_dir.glob(track_glob))
-            log.debug(f"{img.name}: found {len(found)} tracks")
+            log.debug(f"{Path(img).name}: found {len(found)} tracks")
             arr_paths.extend(found)
 
     if not arr_paths:
