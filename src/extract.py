@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 # kymo interface (Mathematica/WolframScript wrappers)
-from kymo_interface import run_kymobutler
+from .kymo_interface import run_kymobutler
 
 # signal-processing modules (package-relative)
 from .signal.detrend import detrend_residual
