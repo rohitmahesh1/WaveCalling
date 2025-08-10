@@ -22,3 +22,6 @@ legacy-files
 
 # ignore data/
 data/
+
+# ignore out/
+out/
