@@ -69,5 +69,5 @@ def list_files(root: Path | str, patterns: Iterable[str]) -> List[Path]:
 def save_dataframe(df: pd.DataFrame, out_path: Path | str) -> Path:
     out_path = Path(out_path)
     ensure_dir(out_path.parent)
-    df.to_csv(out_path, index=False)
+    df.to_csv(out_path, index=False, na_rep="NA")
     return out_path
