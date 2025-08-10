@@ -1,39 +1,41 @@
-# Default configuration for the kymograph PoC pipeline
-
 logging:
   level: INFO  # DEBUG, INFO, WARNING, ERROR
 
 io:
-  sampling_rate: 5.0  # frames per second 
+  sampling_rate: 5.0
   image_globs: ["*.png", "*.jpg", "*.jpeg"]
   track_glob: "*.npy"
+  table_globs: ["*.csv", "*.tsv", "*.xls", "*.xlsx"]   # <- NEW
 
-# --- Detrending (baseline removal) ---
+heatmap:
+  lower: -1e20
+  upper: 1e16
+  binarize: true
+  origin: lower
+  cmap: hot
+
 detrend:
-  degree: 1              # 1=linear, 2=quadratic (surf waves may benefit from 2)
-  min_samples: 0.5       # RANSAC: proportion or absolute count
-  residual_threshold: null  # if null, computed from MAD of y
+  degree: 1
+  min_samples: 0.5
+  residual_threshold: null
   random_state: 42
 
-# --- Peak detection (bulges/spikes) ---
 peaks:
-  prominence: 3.0  # increase to ignore small fluctuations
-  width: 2         # in samples; tune to expected bulge width
-  distance: 8      # min samples between peaks to avoid double-counting
+  prominence: 3.0
+  width: 2
+  distance: 8
 
-# --- Global periodicity estimation ---
 period:
-  sampling_rate: 5.0  # should match io.sampling_rate
-  min_freq: 0.02      # Hz (or cycles per frame if sampling_rate=1)
-  max_freq: 2.0       # upper bound to avoid picking noise
+  sampling_rate: 5.0
+  min_freq: 0.02
+  max_freq: 2.0
 
-# --- Visualization controls ---
 viz:
-  enabled: true            
+  enabled: true
   per_track:
     detrended_with_peaks: true
     spectrum: true
   summary:
     histograms: true
-  hist_bins: 20           # bins for summary histograms
-  dpi: 180                # dpi for saved figures
+  hist_bins: 20
+  dpi: 180
