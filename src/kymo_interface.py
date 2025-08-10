@@ -1,6 +1,6 @@
 import subprocess
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Optional
 import ast
 import numpy as np
 
@@ -8,64 +8,86 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent.parent / "kymobutler_scripts"
 
 
+def _extract_wolfram_list_block(s: str) -> Optional[str]:
+    """
+    Return the substring containing the first full Wolfram list that starts at the
+    first '{{{' and ends at its matching closing brace (balanced), or None if not found.
+    """
+    start = s.find("{{{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(s)):
+        c = s[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                # include this closing brace
+                return s[start : i + 1]
+    return None  # unterminated / not balanced
+
+
 def _parse_mathematica_arrays(stdout_text: str) -> List[np.ndarray]:
     """
-    Extract the big Mathematica list of coordinate lists from stdout.
+    Parse KymoButler's printed coordinate lists from Wolfram stdout into
+    a list of (N,2) float ndarrays. Robust to extra nesting and noise.
 
-    The Wolfram script prints something like {{{{x,y},...}, {{...}}, ...}} plus
-    other messages. We:
-      1) Find the first '{{{' and the last '}}}' after it
-      2) Convert braces -> brackets
-      3) ast.literal_eval to a Python list
-      4) Normalize each item to a 2-col ndarray of shape (N, 2)
+    Strategy:
+      1) Extract the first balanced Wolfram list starting at '{{{'.
+      2) Convert braces -> brackets and literal_eval to a Python object.
+      3) For each item, try to coerce to an (N,2) array, with fallbacks:
+         - direct (N,2)
+         - first element (extra nesting)
+         - reshape-flat to pairs as a last resort
     """
-    start = stdout_text.find("{{{")
-    if start == -1:
+    block = _extract_wolfram_list_block(stdout_text)
+    if not block:
         return []
 
-    # try to find the *last* closing '}}}' (or '}}}}') after start
-    end3 = stdout_text.rfind("}}}")
-    end4 = stdout_text.rfind("}}}}")
-    end = max(end3, end4)
-    if end == -1 or end <= start:
-        return []
-
-    block = stdout_text[start:end+3]  # include the '}}}'
     # Wolfram lists -> Python lists
     py_list_text = block.replace("{", "[").replace("}", "]")
 
     try:
         data = ast.literal_eval(py_list_text)
     except Exception:
-        # Some scripts wrap coordinates like [[[ [x,y], ... ]]]; try a looser approach
         return []
 
-    arrays = []
+    arrays: List[np.ndarray] = []
+
+    def _to_pairs(x) -> Optional[np.ndarray]:
+        try:
+            a = np.asarray(x, dtype=float)
+        except Exception:
+            return None
+
+        if a.ndim == 2 and a.shape[1] == 2:
+            return a
+
+        # Try to coerce the first element when there's an extra nesting level
+        if isinstance(x, (list, tuple)) and len(x) > 0:
+            try:
+                a0 = np.asarray(x[0], dtype=float)
+                if a0.ndim == 2 and a0.shape[1] == 2:
+                    return a0
+            except Exception:
+                pass
+
+        # Last resort: flatten into pairs
+        if a.size % 2 == 0:
+            a = a.reshape(-1, 2)
+            if a.ndim == 2 and a.shape[1] == 2:
+                return a
+
+        return None
+
+    # Expect a list of tracks, but be flexible
     for item in data:
-        # Some outputs nest an extra level: [ [ [x,y], ... ], meta? ... ]
-        # Heuristic: if item[0] looks like a list of 2 numbers, use that.
-        try:
-            cand = np.array(item, dtype=float)
-        except Exception:
-            continue
-
-        if cand.ndim == 2 and cand.shape[1] == 2:
+        cand = _to_pairs(item)
+        if cand is not None:
             arrays.append(cand)
-            continue
-
-        # Try item[0]
-        try:
-            cand0 = np.array(item[0], dtype=float)
-            if cand0.ndim == 2 and cand0.shape[1] == 2:
-                arrays.append(cand0)
-                continue
-        except Exception:
-            pass
-
-        # As a last resort, flatten to Nx2 if possible
-        flat = cand.reshape(-1, 2) if cand.size % 2 == 0 else None
-        if flat is not None and flat.ndim == 2 and flat.shape[1] == 2:
-            arrays.append(flat)
 
     return arrays
 
@@ -74,7 +96,7 @@ def run_kymobutler(
     heatmap_path: Union[str, Path],
     min_length: int = 30,
     verbose: bool = False,
-    script_name: str = "Run_Kymobutler.wls",  # matches your earlier setup
+    script_name: str = "Run_Kymobutler.wls",
 ) -> Path:
     """
     Invoke the KymoButler WolframScript on a heatmap image, parse stdout for
@@ -89,23 +111,17 @@ def run_kymobutler(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     script = SCRIPT_DIR / script_name
-    cmd = [
-        "wolframscript", "-script",
-        str(script),
-        str(heatmap_path)
-    ]
+    cmd = ["wolframscript", "-script", str(script), str(heatmap_path)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    # Always keep stdout/stderr for parsing/logging; show only if verbose
+
     if verbose:
         if proc.stdout:
             print(proc.stdout)
         if proc.stderr:
             print(proc.stderr)
 
-    # This raises if wolframscript returned non-zero
     proc.check_returncode()
 
-    # Parse Mathematica stdout into arrays and write .npy files
     arrays = _parse_mathematica_arrays(proc.stdout or "")
     saved = 0
     for i, arr in enumerate(arrays):
@@ -116,39 +132,55 @@ def run_kymobutler(
         saved += 1
 
     if verbose:
-        print(f"[kymo_interface] Saved {saved} track(s) to {out_dir}")
+        print(
+            f"[kymo_interface] Parsed {len(arrays)} track(s); "
+            f"saved {saved} ≥ min_length to {out_dir}"
+        )
 
     return base_dir
 
 
 def preprocess_image(
     image_path: Union[str, Path],
-    verbose: bool = False
+    verbose: bool = False,
+    script_name: str = "Run_Kymobutler_Save_Image.wls",
+    output_suffix: str = "_processed_2.png",
 ) -> Path:
     """
     Run the Mathematica preprocessing script to prepare a raw kymograph image.
 
     Returns the processed image path in the 'proc' subfolder.
+
+    Parameters
+    ----------
+    image_path : str | Path
+        Input raw kymograph.
+    verbose : bool
+        If True, print Wolfram stdout/stderr.
+    script_name : str
+        WolframScript filename to invoke from SCRIPT_DIR.
+    output_suffix : str
+        Expected suffix of the output filename produced by the Wolfram script.
+        Defaults to '_processed_2.png' to match prior behavior.
     """
     image_path = Path(image_path)
     proc_dir = image_path.parent / image_path.stem / "proc"
     proc_dir.mkdir(parents=True, exist_ok=True)
-    script = SCRIPT_DIR / "Run_Kymobutler_Save_Image.wls"
-    cmd = [
-        "wolframscript", "-script",
-        str(script),
-        str(proc_dir),
-        str(image_path)
-    ]
+
+    script = SCRIPT_DIR / script_name
+    cmd = ["wolframscript", "-script", str(script), str(proc_dir), str(image_path)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
+
     if verbose:
         if proc.stdout:
             print(proc.stdout)
         if proc.stderr:
             print(proc.stderr)
+
     proc.check_returncode()
 
-    processed = proc_dir / f"{image_path.stem}_processed_2.png"
+    processed = proc_dir / f"{image_path.stem}{output_suffix}"
     if not processed.exists():
         raise FileNotFoundError(f"Processed image not found: {processed}")
+
     return processed
