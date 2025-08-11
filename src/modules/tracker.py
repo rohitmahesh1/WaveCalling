@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional, Dict, Iterable
 import numpy as np
 import cv2
 
-from kymobutler_pt import KymoButlerPT, prob_to_mask, skeletonize
+from .kymobutler_pt import KymoButlerPT, prob_to_mask, skeletonize
 
 Coord = Tuple[int, int]  # (y, x)
 
