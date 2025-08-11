@@ -370,6 +370,17 @@ def main():
     # write per-wave results
     waves_csv = Path(args.output_csv).with_name(Path(args.output_csv).stem + "_waves.csv")
     df_waves = pd.DataFrame(wave_results)
+
+    if not df_waves.empty:
+        # Coerce Track to numeric for a true numeric sort (handles "0"..."102", etc.)
+        df_waves["Track"] = pd.to_numeric(df_waves["Track"], errors="coerce").astype("Int64")
+        # Stable sort: by Track, then Wave number, then Frame position 1 (optional)
+        df_waves = df_waves.sort_values(
+            ["Track", "Wave number", "Frame position 1"],
+            kind="mergesort",
+            ignore_index=True,
+        )
+
     df_waves.to_csv(waves_csv, index=False, na_rep="NA")
     log.info(f"Per-wave metrics saved to {waves_csv}")
 
