@@ -25,3 +25,6 @@ data/
 
 # ignore out/
 out/
+
+# ignore export/
+export/
