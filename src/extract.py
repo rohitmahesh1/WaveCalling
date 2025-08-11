@@ -33,6 +33,71 @@ from .utils import (
 )
 
 
+def _sample_name_from_arr_path(arr_path: Path) -> str:
+    """
+    Heuristic to recover the sample name from the track path:
+      .../<SAMPLE>_heatmap/kymobutler_output/NN.npy -> SAMPLE
+    If no '_heatmap' suffix, return the directory name above kymobutler_output.
+    """
+    base = arr_path.parent.parent.name  # e.g., <SAMPLE>_heatmap
+    if base.endswith("_heatmap"):
+        return base[:-8]
+    return base
+
+
+def _waves_from_peaks(
+    x: np.ndarray,
+    y: np.ndarray,
+    residual: np.ndarray,
+    peaks_idx: np.ndarray,
+    sampling_rate: float,
+    sample: str,
+    track_stem: str,
+) -> list[dict]:
+    """
+    Build per-wave rows from consecutive peak pairs (k -> k+1).
+    """
+    rows: list[dict] = []
+    p = np.asarray(peaks_idx, dtype=int)
+    if p.size < 2:
+        return rows
+
+    for k in range(p.size - 1):
+        i, j = int(p[k]), int(p[k + 1])
+
+        frame1 = float(x[i])
+        frame2 = float(x[j])
+        period_frames = frame2 - frame1
+        period_s = period_frames / sampling_rate if sampling_rate else float("nan")
+        freq = (1.0 / period_s) if (period_s and period_s > 0) else float("nan")
+
+        pos1 = float(y[i])         # raw pixel position at first peak
+        pos2 = float(y[j])         # raw pixel position at second peak
+        amp = float(residual[i])   # amplitude at first peak (residual height)
+
+        dpos = pos2 - pos1
+        vel = (dpos / period_s) if (period_s and period_s != 0) else float("nan")
+        wavelength = abs(dpos)     # with peak-to-peak period, λ = |Δpos|
+
+        rows.append({
+            "Sample": sample,
+            "Track": track_stem,
+            "Wave number": k + 1,
+            "Frame position 1": frame1,
+            "Frame position 2": frame2,
+            "Period (frames)": period_frames,
+            "Period (s)": period_s,
+            "Frequency (Hz)": freq,
+            "Pixel position 1": pos1,
+            "Pixel position 2": pos2,
+            "Amplitude (pixels)": amp,
+            "Δposition (px)": dpos,
+            "Velocity (px/s)": vel,
+            "Wavelength (px)": wavelength,
+        })
+    return rows
+
+
 def process_track(
     arr_path: Path,
     detrend_cfg: dict,
@@ -45,12 +110,11 @@ def process_track(
     make_plot_spectrum: bool = True,
     dpi: int | None = None,
     log=None,
-) -> dict:
+) -> tuple[dict, list[dict]]:
     """
     Load a track (.npy), compute residual, detect peaks, estimate frequency,
-    and optionally save diagnostic plots.
-
-    Returns a dict of track-level metrics.
+    make plots (optional), and return:
+      (track_level_metrics_dict, [per-wave rows])
     """
     data = np.load(arr_path)
     # assume data shape (N, 2): columns [x, y]
@@ -68,6 +132,15 @@ def process_track(
     period = frequency_to_period(freq)
 
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
+
+    # per-wave rows (peak -> next peak)
+    sample_name = _sample_name_from_arr_path(arr_path)
+    wave_rows = _waves_from_peaks(
+        x, y, residual, peaks_idx,
+        sampling_rate=sampling_rate if sampling_rate is not None else 1.0,
+        sample=sample_name,
+        track_stem=arr_path.stem,
+    )
 
     # optional plotting controlled by viz toggles
     if plots_dir is not None:
@@ -102,10 +175,10 @@ def process_track(
                         dpi=dpi,
                         title_prefix=arr_path.stem,
                         overlay_fit=True,
-                )
+                    )
             except Exception as e:
                 if log:
-                    log.debug(f'Plot detrended_with_peaks failed for {arr_path.name}: {e}')
+                    log.debug(f'Plot detrended_with_peaks/peak_windows failed for {arr.name}: {e}')
         # Spectrum
         if make_plot_spectrum and (sampling_rate is not None):
             try:
@@ -118,9 +191,9 @@ def process_track(
                 )
             except Exception as e:
                 if log:
-                    log.debug(f'Plot spectrum failed for {arr_path.name}: {e}')
+                    log.debug(f'Plot spectrum failed for {arr.name}: {e}')
 
-    return {
+    track_metrics = {
         'track': arr_path.stem,
         'num_peaks': int(len(peaks_idx)),
         'mean_amplitude': float(np.mean(amps)) if amps.size > 0 else float('nan'),
@@ -129,6 +202,7 @@ def process_track(
         'dominant_frequency': float(freq),
         'period': float(period),
     }
+    return track_metrics, wave_rows
 
 
 def main():
@@ -197,7 +271,6 @@ def main():
     dpi = int(viz_cfg.get('dpi', 180))
 
     input_path = Path(args.input_dir)
-    results = []
 
     # determine plotting directory (requires CLI flag and viz.enabled)
     plots_dir = None
@@ -267,10 +340,12 @@ def main():
         raise SystemExit(2)
 
     # process each track array
+    track_results: list[dict] = []
+    wave_results: list[dict] = []
     for arr in arr_paths:
         log.debug(f'Processing track {arr.name}...')
         try:
-            metrics = process_track(
+            metrics, wave_rows = process_track(
                 arr,
                 detrend_cfg,
                 peaks_cfg,
@@ -282,18 +357,25 @@ def main():
                 dpi=dpi,
                 log=log,
             )
-            results.append(metrics)
+            track_results.append(metrics)
+            wave_results.extend(wave_rows)
         except Exception as e:
             log.exception(f'Failed on {arr}: {e}')
 
-    # write results
-    df = pd.DataFrame(results)
-    save_dataframe(df, args.output_csv)
-    log.info(f"Metrics saved to {args.output_csv}")
+    # write track-level results
+    df_tracks = pd.DataFrame(track_results)
+    save_dataframe(df_tracks, args.output_csv)
+    log.info(f"Track metrics saved to {args.output_csv}")
 
-    # summary plots (honor viz toggles)
+    # write per-wave results
+    waves_csv = Path(args.output_csv).with_name(Path(args.output_csv).stem + "_waves.csv")
+    df_waves = pd.DataFrame(wave_results)
+    df_waves.to_csv(waves_csv, index=False, na_rep="NA")
+    log.info(f"Per-wave metrics saved to {waves_csv}")
+
+    # summary plots (honor viz toggles) — based on track-level stats
     if plots_dir is not None and make_summary_hists:
-        plot_summary_histograms(df, plots_dir, bins=hist_bins, dpi=dpi)
+        plot_summary_histograms(df_tracks, plots_dir, bins=hist_bins, dpi=dpi)
         log.info(f"Summary plots saved under {plots_dir}")
 
 
