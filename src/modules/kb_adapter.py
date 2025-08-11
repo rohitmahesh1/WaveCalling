@@ -8,8 +8,8 @@ import numpy as np
 import cv2
 
 # Our PyTorch/ONNX wrappers
-from kymobutler_pt import KymoButlerPT, prob_to_mask, skeletonize
-from tracker import CrossingTracker, Track
+from .kymobutler_pt import KymoButlerPT, prob_to_mask, skeletonize
+from .tracker import CrossingTracker, Track
 
 # ---------------------------
 # Python-only preprocessing
