@@ -61,15 +61,88 @@ def _sigmoid(x):
 class ORTModel:
     def __init__(self, path: str):
         self.path = str(path)
-        self.sess = ort.InferenceSession(self.path, providers=["CPUExecutionProvider"])
-        self.inputs = [i.name for i in self.sess.get_inputs()]
-        self.outputs = [o.name for o in self.sess.get_outputs()]
-        # assume single input
-        self.in_name = self.inputs[0]
+        # Load model to introspect initializers (some exporters put them in graph inputs)
+        self.model = onnx.load(self.path)
+        self.init_names = {init.name for init in self.model.graph.initializer}
 
-    def run(self, x: np.ndarray) -> dict[str,np.ndarray]:
-        out = self.sess.run(self.outputs, {self.in_name: x})
-        return {name: arr for name,arr in zip(self.outputs, out)}
+        # ORT session
+        self.sess = ort.InferenceSession(self.path, providers=["CPUExecutionProvider"])
+        self.inputs_meta = self.sess.get_inputs()
+        self.outputs = [o.name for o in self.sess.get_outputs()]
+
+        # Pick the primary tensor input (NCHW) heuristically
+        def _rank(shape):
+            return 0 if shape is None else sum(1 for d in shape if d is not None)
+        candidates = sorted(self.inputs_meta, key=lambda a: _rank(a.shape or []), reverse=True)
+        # prefer names like "Input" or containing "input"
+        for a in candidates:
+            nm = a.name.lower()
+            if "input" in nm or _rank(a.shape or []) >= 3:
+                self.data_input = a
+                break
+        else:
+            self.data_input = self.inputs_meta[0]
+
+    def _default_for(self, arg: ort.NodeArg):
+        """Return a default NumPy value for non-data inputs (scalars by dtype), or None to skip."""
+        name = arg.name
+        # If it's actually an initializer, ORT doesn't need us to feed it
+        if name in self.init_names:
+            return None
+
+        t = (arg.type or "").lower()
+        shp = arg.shape  # may be None or contain None dims
+        # Treat scalars as (), 1D-unknown as (1,)
+        if not shp:
+            shp = ()
+        elif any(d is None for d in shp):
+            # if it's clearly not the data tensor, make it a scalar or 1
+            shp = tuple(1 for _ in shp)
+
+        # Heuristics by name
+        if name.lower() in {"trainingmode", "is_training", "training", "train"} or "trainingmode" in name.lower():
+            return np.array(False, dtype=np.bool_)
+        if name.lower().endswith("ratio") or name.lower().startswith("ratio"):
+            return np.array(0.0, dtype=np.float32)
+
+        # By dtype
+        if "bool" in t:
+            return np.zeros(shp, dtype=np.bool_)
+        if "float16" in t:
+            return np.zeros(shp, dtype=np.float16)
+        if "float" in t or "tensor(float" in t:
+            return np.zeros(shp, dtype=np.float32)
+        if "double" in t:
+            return np.zeros(shp, dtype=np.float64)
+        if "int64" in t:
+            return np.zeros(shp, dtype=np.int64)
+        if "int32" in t:
+            return np.zeros(shp, dtype=np.int32)
+        if "int16" in t:
+            return np.zeros(shp, dtype=np.int16)
+        if "int8" in t:
+            return np.zeros(shp, dtype=np.int8)
+        if "uint8" in t:
+            return np.zeros(shp, dtype=np.uint8)
+
+        # Fallback: scalar float
+        return np.array(0.0, dtype=np.float32)
+
+    def run(self, x: np.ndarray) -> dict[str, np.ndarray]:
+        feed = {}
+        # Feed the main data input
+        feed[self.data_input.name] = x.astype(np.float32, copy=False)
+
+        # Feed defaults for the rest
+        for arg in self.inputs_meta:
+            if arg.name == self.data_input.name:
+                continue
+            default = self._default_for(arg)
+            if default is not None:
+                feed[arg.name] = default
+
+        outs = self.sess.run(self.outputs, feed)
+        return {name: arr for name, arr in zip(self.outputs, outs)}
 
 class KymoButlerPT:
     """
