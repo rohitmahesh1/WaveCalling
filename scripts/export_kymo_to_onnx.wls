@@ -1,70 +1,55 @@
-(* Start clean *)
+(* scripts/export_kymo_to_onnx.wls *)
+
 ClearAll["Global`*"];
 
-(* -------- Args & defaults -------- *)
+(* Args *)
 args      = Rest @ $ScriptCommandLine;
 modelsDir = If[Length[args] >= 1, args[[1]], "models"];
 outDir    = If[Length[args] >= 2, args[[2]], "export"];
-inH       = If[Length[args] >= 3, ToExpression@args[[3]], 256];
+inH       = If[Length[args] >= 3, ToExpression@args[[3]], 256];  (* for seg nets *)
 inW       = If[Length[args] >= 4, ToExpression@args[[4]], 512];
-inColor   = If[Length[args] >= 5, args[[5]], "Grayscale"];  (* "Grayscale" or "RGB" *)
 
-(* -------- Validation -------- *)
-If[!DirectoryQ[modelsDir],
-  Print["ERROR: Models directory not found: ", modelsDir];
-  Exit[1];
-];
-
+If[!DirectoryQ[modelsDir], Print["ERROR: Models directory not found: ", modelsDir]; Exit[1]];
 CreateDirectory[outDir, CreateIntermediateDirectories -> True];
 
-(* -------- Mapping (src -> target filename) -------- *)
-names = <|
-  "Unidrectional_Segmentation_Module_V1_0" -> "uni_seg.onnx",
-  "Bidirectional_Segmentation_Module_V1_1" -> "bi_seg.onnx",
-  "Classification_Module_V1_0"             -> "classifier.onnx",
-  "Decision_Module_V1_0"                   -> "decision.onnx"
+(* Per-model export targets + input tensor dims {C,H,W} *)
+specs = <|
+  "Unidrectional_Segmentation_Module_V1_0" -> <|"onnx"->"uni_seg.onnx", "dims"->{1, inH, inW}|>,
+  "Bidirectional_Segmentation_Module_V1_1" -> <|"onnx"->"bi_seg.onnx",  "dims"->{1, inH, inW}|>,
+  "Classification_Module_V1_0"             -> <|"onnx"->"classifier.onnx","dims"->{1, 64, 64}|>,
+  "Decision_Module_V1_0"                   -> <|"onnx"->"decision.onnx",  "dims"->{3, 48, 48}|>
 |>;
 
-(* -------- Helpers -------- *)
-fixInputSize[net_, size : {h_Integer, w_Integer}, color_String] := Module[
-  {ports, key, enc},
+(* Replace the input encoder with a Tensor encoder that exactly matches the net’s expected array *)
+fixInputToTensor[net_, dims : {c_, h_, w_}] := Module[{ports, key},
   ports = Quiet @ NetInformation[net, "InputPorts"];
   key   = If[AssociationQ@ports && KeyExistsQ[ports, "Input"],
              "Input",
-             If[AssociationQ@ports && Length@ports >= 1, First@Keys@ports, None]
-          ];
+             If[AssociationQ@ports && Length@ports >= 1, First@Keys@ports, None]];
   If[key === None, Return[net]];
-  enc = NetEncoder[{"Image", size, color}];
-  NetReplacePart[net, key -> enc]
+  NetReplacePart[net, key -> NetEncoder[{"Tensor", dims, "Real"}]]
 ];
 
-exportOne[src_, tgt_] := Module[{srcPath, tgtPath, net, ok},
-  srcPath = FileNameJoin[{modelsDir, src}];
-  tgtPath = FileNameJoin[{outDir,    tgt}];
+exportOne[name_, conf_] := Module[{srcPath, tgtPath, net, ok},
+  srcPath = FileNameJoin[{modelsDir, name}];
+  tgtPath = FileNameJoin[{outDir, conf["onnx"]}];
 
   If[!FileExistsQ[srcPath],
-    Print["WARN: Missing model: ", srcPath];
-    Return[$Failed];
+    Print["WARN: Missing model: ", srcPath]; Return[$Failed];
   ];
 
-  Print["Exporting: ", src, " -> ", tgt];
-  net = Check[
-    Import[srcPath],
-    Print["ERROR: Failed to import ", srcPath]; Return[$Failed];
-  ];
+  Print["Exporting: ", name, "  →  ", conf["onnx"], "  with dims ", conf["dims"]];
+  net = Check[ Import[srcPath], Print["ERROR: Failed to import ", srcPath]; Return[$Failed]; ];
 
-  net = fixInputSize[net, {inH, inW}, inColor];
+  (* set an explicit fixed shape for ONNX *)
+  net = fixInputToTensor[net, conf["dims"]];
 
-  ok = Check[
-    Export[tgtPath, net, "ONNX"],
-    Print["ERROR: Failed to export to ", tgtPath]; Return[$Failed];
-  ];
-
+  ok = Check[ Export[tgtPath, net, "ONNX"],
+              Print["ERROR: Failed to export to ", tgtPath]; Return[$Failed]; ];
   ok
 ];
 
-(* -------- Run -------- *)
-KeyValueMap[exportOne, names];
+KeyValueMap[exportOne, specs];
 
 Print["Done. Saved to ", outDir];
 Exit[0];
