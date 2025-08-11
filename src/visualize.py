@@ -42,6 +42,78 @@ def plot_track(
     return save_path
 
 
+def _fit_global_sine(
+    residual: np.ndarray,
+    x: np.ndarray,
+    sampling_rate: float,
+    freq: float,
+    amp_override: float | None = None,
+    phase_override: float | None = None,
+    center_peak_idx: int | None = None,
+):
+    """
+    Fit residual with a fixed frequency sine.
+
+    If center_peak_idx is provided, choose phase so that the sine's MAXIMUM
+    occurs exactly at that peak: phi = pi/2 - w * t_peak. Then fit only A and c:
+        residual ~ A * sin(w t + phi_fixed) + c
+    Otherwise, use the unconstrained (a*sin + b*cos + c) least-squares parameterization.
+
+    Returns: (y_fit_residual, A, phi, c)
+    """
+    if sampling_rate is None or freq is None or freq <= 0:
+        return None, None, None, None
+
+    t = x / float(sampling_rate)
+    w = 2.0 * np.pi * float(freq)
+
+    # Phase-anchored fit (peak-centered)
+    if center_peak_idx is not None and 0 <= center_peak_idx < len(x):
+        t_peak = float(t[center_peak_idx])
+        phi = (np.pi / 2.0) - w * t_peak  # maximum at t_peak
+        S = np.column_stack([np.sin(w * t + phi), np.ones_like(t)])  # solve for [A, c]
+        beta, *_ = np.linalg.lstsq(S, residual, rcond=None)
+        A, c = float(beta[0]), float(beta[1])
+
+        # Ensure A >= 0 so that t_peak is indeed a maximum; if A<0, flip amp and shift phase by pi
+        if A < 0:
+            A = -A
+            phi += np.pi
+
+        # Optional overrides
+        if amp_override is not None:
+            A = float(amp_override)
+        if phase_override is not None:
+            phi = float(phase_override)
+
+        yfit_res = A * np.sin(w * t + phi) + c
+        return yfit_res, float(A), float(phi), float(c)
+
+    # Unconstrained global fit (fallback)
+    X = np.column_stack([np.sin(w * t), np.cos(w * t), np.ones_like(t)])
+    beta, *_ = np.linalg.lstsq(X, residual, rcond=None)
+    a, b, c = map(float, beta)
+    A = float(np.hypot(a, b))
+    phi = float(np.arctan2(b, a))
+
+    # Optional overrides
+    if amp_override is not None and A > 0:
+        scale = float(amp_override) / A
+        a *= scale
+        b *= scale
+        A = float(amp_override)
+        phi = float(np.arctan2(b, a))
+    if phase_override is not None:
+        A_now = float(np.hypot(a, b))
+        A_use = A if amp_override is not None else A_now
+        a = A_use * np.cos(float(phase_override))
+        b = A_use * np.sin(float(phase_override))
+        phi = float(phase_override)
+
+    yfit_res = X @ np.array([a, b, c])
+    return yfit_res, float(A), float(phi), float(c)
+
+
 def plot_peak_windows(
     x: np.ndarray,
     y: np.ndarray,
@@ -60,7 +132,8 @@ def plot_peak_windows(
 ) -> List[Path]:
     """
     For each peak, plot a window of width = period_frac * period centered on that peak.
-    Overlays baseline, residual, peak marker, and (optionally) baseline+sine fit.
+    Overlays baseline, residual, peak marker, and (optionally) baseline+sine fit
+    that is PHASE-ANCHORED at that peak.
     Returns the list of saved file paths.
     """
     save_dir = Path(save_dir)
@@ -83,19 +156,11 @@ def plot_peak_windows(
         baseline = model.predict(x.reshape(-1, 1))
         residual = y - baseline
 
-    # If we can, precompute the global sine fit over the full signal
-    yfit_res = None
-    if overlay_fit and sampling_rate and freq and freq > 0:
-        from .visualize import _fit_global_sine  # local import to avoid cycles
-        yfit_res, _, _, _ = _fit_global_sine(residual, x, sampling_rate, freq)
-
-    # How many frames correspond to one period?
+    # Frames per period (for window size)
     if sampling_rate and freq and freq > 0:
         frames_per_period = sampling_rate / float(freq)
     else:
-        # Fallback: a modest fixed window if frequency is unknown
-        frames_per_period = 40.0
-
+        frames_per_period = 40.0  # fallback window width
     half_span = max(1, int(round((period_frac * frames_per_period) / 2.0)))
 
     saved: List[Path] = []
@@ -107,19 +172,25 @@ def plot_peak_windows(
         raw = y[lo:hi + 1]
         base = baseline[lo:hi + 1]
         res = residual[lo:hi + 1]
+
+        # Phase-anchored local overlay (baseline + sine centered at this peak)
         yfit_seg = None
-        if yfit_res is not None:
-            yfit_seg = (baseline + yfit_res)[lo:hi + 1]
+        if overlay_fit and sampling_rate and freq and freq > 0:
+            yfit_res_local, _, _, _ = _fit_global_sine(
+                residual, x, sampling_rate, freq,
+                center_peak_idx=int(pk)
+            )
+            if yfit_res_local is not None:
+                yfit_seg = (baseline + yfit_res_local)[lo:hi + 1]
 
         # Plot with axes flipped (X=position, Y=time)
         plt.figure(figsize=(6, 4))
         plt.plot(raw, xs, linewidth=1, label="raw")
         plt.plot(base, xs, linewidth=1, linestyle="--", label="baseline")
         plt.plot(res, xs, linewidth=1, label="residual")
-        # peak marker (at residual value)
         plt.scatter(residual[pk], x[pk], s=25, label="peak")
         if yfit_seg is not None:
-            plt.plot(yfit_seg, xs, linewidth=1.2, alpha=0.95, label=f"sine fit")
+            plt.plot(yfit_seg, xs, linewidth=1.2, alpha=0.95, label="sine fit (anchored)")
 
         plt.xlabel("Position")
         plt.ylabel("Time")
@@ -136,50 +207,6 @@ def plot_peak_windows(
     return saved
 
 
-def _fit_global_sine(residual: np.ndarray,
-                     x: np.ndarray,
-                     sampling_rate: float,
-                     freq: float,
-                     amp_override: float | None = None,
-                     phase_override: float | None = None):
-    """
-    Fit residual ~ a*sin(wt) + b*cos(wt) + c at a fixed frequency.
-    Returns (y_fit_residual, A, phi, c).
-    """
-    if sampling_rate is None or freq is None or freq <= 0:
-        return None, None, None, None
-
-    t = x / float(sampling_rate)
-    w = 2.0 * np.pi * float(freq)
-
-    X = np.column_stack([np.sin(w * t), np.cos(w * t), np.ones_like(t)])
-    # Least-squares solve
-    beta, *_ = np.linalg.lstsq(X, residual, rcond=None)
-    a, b, c = beta
-    A = float(np.hypot(a, b))
-    phi = float(np.arctan2(b, a))
-
-    # Optional overrides
-    if amp_override is not None and A > 0:
-        scale = float(amp_override) / A
-        a *= scale
-        b *= scale
-        A = float(amp_override)
-        phi = float(np.arctan2(b, a))
-    if phase_override is not None:
-        # enforce requested phase with current amplitude
-        A_now = float(np.hypot(a, b))
-        if A_now == 0 and (amp_override is None):
-            A_now = 0.0
-        A_use = A if amp_override is not None else A_now
-        a = A_use * np.cos(float(phase_override))
-        b = A_use * np.sin(float(phase_override))
-        phi = float(phase_override)
-
-    yfit_res = X @ np.array([a, b, c])
-    return yfit_res, A, phi, float(c)
-
-
 def plot_detrended_with_peaks(
     x: np.ndarray,
     y: np.ndarray,
@@ -191,7 +218,7 @@ def plot_detrended_with_peaks(
     title: Optional[str] = None,
     show: bool = False,
     dpi: int | None = None,
-    # NEW: overlay controls
+    # overlay controls
     overlay_fit: bool = False,
     sampling_rate: float | None = None,
     freq: float | None = None,
@@ -203,7 +230,8 @@ def plot_detrended_with_peaks(
     with axes flipped so X = position, Y = time.
 
     If overlay_fit is True (and sampling_rate & freq are provided),
-    also draw (baseline + global sine fit) over the raw track.
+    also draw (baseline + global sine fit) over the raw track, with phase
+    **anchored at the strongest detected peak**.
     """
     save_path = _ensure_parent(save_path)
     ransac_kwargs = (ransac_kwargs or {}).copy()
@@ -235,16 +263,21 @@ def plot_detrended_with_peaks(
     if peaks_idx.size:
         plt.scatter(residual[peaks_idx], x[peaks_idx], s=20, label="peaks")
 
-    # optional global-sine overlay: (baseline + fitted residual)
+    # optional global-sine overlay: (baseline + fitted residual), anchored
     if overlay_fit and (sampling_rate is not None) and (freq is not None) and freq > 0:
+        center_idx = None
+        if peaks_idx.size:
+            # anchor to the strongest residual peak
+            center_idx = int(peaks_idx[np.argmax(residual[peaks_idx])])
         yfit_res, A, phi, c = _fit_global_sine(
             residual, x, sampling_rate, freq,
-            amp_override=amp_override, phase_override=phase_override
+            amp_override=amp_override, phase_override=phase_override,
+            center_peak_idx=center_idx
         )
         if yfit_res is not None:
             yfit = (baseline if baseline is not None else 0.0) + yfit_res
             # axes flipped
-            plt.plot(yfit, x, linewidth=1.2, alpha=0.9, label=f"sine fit f={freq:.3g}Hz")
+            plt.plot(yfit, x, linewidth=1.2, alpha=0.9, label=f"sine fit (anchored) f={freq:.3g}Hz")
 
     plt.xlabel("Position")
     plt.ylabel("Time")
