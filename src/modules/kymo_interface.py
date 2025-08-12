@@ -5,7 +5,7 @@ import ast
 import numpy as np
 
 # Directory containing the Mathematica/WolframScript kymobutler scripts
-SCRIPT_DIR = Path(__file__).resolve().parent.parent / "kymobutler_scripts"
+SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent / "kymobutler_scripts"
 
 
 def _extract_wolfram_list_block(s: str) -> Optional[str]:
