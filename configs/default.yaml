@@ -39,3 +39,29 @@ viz:
     histograms: true
   hist_bins: 20
   dpi: 180
+
+kymo:
+  force_mode: bi
+  seg_size: 256
+
+  # thresholds
+  thr: 0.20
+  thr_bi: 0.18       # (was effectively 0.35)
+  thr_uni: 0.20
+
+  # WL-like mask→skeleton shaping
+  morph_close_open_close: true
+  comp_min_px: 5       # relax from 10
+  comp_min_rows: 5     # relax from 10
+  prune_iters: 2       # relax from 3
+
+  # tracking / save
+  min_length: 30
+
+  # bridges weak segments
+  hysteresis_enable: true
+  hysteresis_low: 0.08
+  hysteresis_high: 0.18
+
+  prune_iters: 0
+
