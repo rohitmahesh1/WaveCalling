@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 
 # kymo interface (Mathematica/WolframScript wrappers)
-from .kymo_interface import run_kymobutler
+# from .modules.kymo_interface import run_kymobutler  # (use for Mathematica scripts)
+from .modules.kb_adapter import run_kymobutler
 
 # signal-processing modules (package-relative)
 from .signal.detrend import detrend_residual
@@ -178,7 +179,7 @@ def process_track(
                     )
             except Exception as e:
                 if log:
-                    log.debug(f'Plot detrended_with_peaks/peak_windows failed for {arr.name}: {e}')
+                    log.debug(f'Plot detrended_with_peaks/peak_windows failed for {arr_path.name}: {e}')
         # Spectrum
         if make_plot_spectrum and (sampling_rate is not None):
             try:
@@ -191,7 +192,7 @@ def process_track(
                 )
             except Exception as e:
                 if log:
-                    log.debug(f'Plot spectrum failed for {arr.name}: {e}')
+                    log.debug(f'Plot spectrum failed for {arr_path.name}: {e}')
 
     track_metrics = {
         'track': arr_path.stem,
@@ -270,6 +271,27 @@ def main():
     hist_bins = int(viz_cfg.get('hist_bins', 20))
     dpi = int(viz_cfg.get('dpi', 180))
 
+    # --- KymoButler (ONNX) runtime config ---
+    kymo_cfg = cfg.get('kymo', {})
+    kymo_export_dir = kymo_cfg.get('export_dir', None)
+    kymo_force_mode = kymo_cfg.get('force_mode', 'bi')  # bi matches WL behavior
+    kymo_seg_size   = int(kymo_cfg.get('seg_size', 256))
+
+    # thresholds
+    kymo_thr       = float(kymo_cfg.get('thr', 0.20))
+    kymo_thr_uni   = kymo_cfg.get('thr_uni', None)
+    kymo_thr_bi    = kymo_cfg.get('thr_bi', None)
+
+    # WL-like shaping
+    kymo_morph_coc     = bool(kymo_cfg.get('morph_close_open_close', True))
+    kymo_min_comp_px   = int(kymo_cfg.get('min_component_px', 5))  # legacy compat
+    kymo_comp_min_px   = int(kymo_cfg.get('comp_min_px', 10))
+    kymo_comp_min_rows = int(kymo_cfg.get('comp_min_rows', 10))
+    kymo_prune_iters   = int(kymo_cfg.get('prune_iters', 3))
+
+    # final save gate
+    kymo_min_length = int(kymo_cfg.get('min_length', 30))
+
     input_path = Path(args.input_dir)
 
     # determine plotting directory (requires CLI flag and viz.enabled)
@@ -329,7 +351,22 @@ def main():
         arr_paths = []
         for img in all_images:
             log.debug(f'Running KymoButler on {img}...')
-            base_dir = run_kymobutler(str(img), verbose=args.verbose)
+            base_dir = run_kymobutler(
+                str(img),
+                min_length=kymo_min_length,
+                verbose=args.verbose,
+                export_dir=kymo_export_dir,
+                seg_size=kymo_seg_size,
+                thr=kymo_thr,
+                min_component_px=kymo_min_comp_px,
+                force_mode=kymo_force_mode,
+                thr_uni=kymo_thr_uni,
+                thr_bi=kymo_thr_bi,
+                morph_close_open_close=kymo_morph_coc,
+                comp_min_px=kymo_comp_min_px,
+                comp_min_rows=kymo_comp_min_rows,
+                prune_iters=kymo_prune_iters,
+            )
             out_dir = base_dir / 'kymobutler_output'
             found = sorted(out_dir.glob(track_glob))
             log.debug(f"{Path(img).name}: found {len(found)} tracks")
