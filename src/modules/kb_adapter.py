@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union, List, Tuple, Optional
 from skimage.filters import apply_hysteresis_threshold
+from skimage.morphology import thin as _thin
 import numpy as np
 import cv2
 
@@ -11,6 +12,8 @@ from .kymobutler_pt import (
     prob_to_mask,
     thin_and_prune,        # new: WL-like skeleton op
     filter_components,     # new: WL-like component filter
+    skeletonize,
+    prune_endpoints,
 )
 from .tracker import CrossingTracker, Track, enforce_one_point_per_row
 
@@ -226,6 +229,8 @@ def run_kymobutler(
     hysteresis_low: float = 0.10,
     hysteresis_high: float = 0.20,
     directional_close: bool = True,
+    fuse_uni_into_bi: bool = True,
+    fuse_uni_weight: float = 0.7
 ) -> Path:
     """
     Pure-Python replacement for the Mathematica runner.
@@ -265,14 +270,17 @@ def run_kymobutler(
     if mode == "uni":
         out = kb.segment_uni(gray_orig)
         prob = np.maximum(out["ant"], out["ret"])
-        used_thr = float(t_uni)
-        if verbose:
-            (base_dir / "debug").mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(base_dir / "debug" / "uni_ant.png"), (out["ant"] * 255).astype(np.uint8))
-            cv2.imwrite(str(base_dir / "debug" / "uni_ret.png"), (out["ret"] * 255).astype(np.uint8))
+        used_thr = t_uni
     else:
-        prob = kb.segment_bi(gray_orig)
-        used_thr = float(t_bi)
+        prob_bi = kb.segment_bi(gray_orig)
+        if fuse_uni_into_bi:   # pass cfg in or use function arg
+            outu = kb.segment_uni(gray_orig)
+            prob_uni = np.maximum(outu["ant"], outu["ret"])
+            w = fuse_uni_weight
+            prob = np.maximum(prob_bi, w * prob_uni)
+        else:
+            prob = prob_bi
+        used_thr = t_bi
 
     # 3) threshold + WL-ish cleanups (all in seg space)
     #    auto-tune threshold if extremely sparse or dense
@@ -299,16 +307,44 @@ def run_kymobutler(
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     elif directional_close:
+        """
         kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))  # vertical
         kh = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))  # horizontal
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kv)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kh)
+        """
+        # stronger directional close
+        kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))  # vertical
+        kh = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))  # horizontal
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kv)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kh)
+
+        # diagonal bridge with proper 3×3 kernels (center anchor)
+        kdl = np.array([[1, 0, 1],
+                        [0, 1, 0],
+                        [1, 0, 1]], dtype=np.uint8)   # connects / and \ gaps
+        kdr = np.array([[0, 1, 0],
+                        [1, 1, 1],
+                        [0, 1, 0]], dtype=np.uint8)   # connects + gaps robustly
+        mask_dl = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kdl)
+        mask_dr = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kdr)
+        mask = np.maximum(mask, np.maximum(mask_dl, mask_dr)).astype(np.uint8)
 
     # WL: drop tiny blobs before skeletonization
     mask_f = filter_components(mask, min_px=comp_min_px, min_rows=comp_min_rows)
 
-    # WL: Pruning[Thinning@..., 3]
-    skel = thin_and_prune(mask_f, prune_iters=prune_iters)
+    # --- skeletonization: THIN preserves obliques better than Zhang–Suen in our case
+    skel = _thin(mask_f.astype(bool)).astype(np.uint8)
+
+    # optional: close tiny 1-px voids on the skeleton (bridges tiny breaks), then re-thin
+    # (you can skip this if skeleton.png already looks clean)
+    skel_closed = cv2.morphologyEx(skel, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    skel = _thin(skel_closed.astype(bool)).astype(np.uint8)
+
+    # --- prune endpoints lightly (equivalent to Pruning[..., prune_iters] in WL)
+    if prune_iters > 0:
+        skel = prune_endpoints(skel, iterations=prune_iters)  # see helper below
 
     if verbose:
         dbg = base_dir / "debug"
@@ -318,6 +354,8 @@ def run_kymobutler(
         cv2.imwrite(str(dbg / "mask_clean.png"), (mask * 255))
         cv2.imwrite(str(dbg / "mask_filtered.png"), (mask_f * 255))
         cv2.imwrite(str(dbg / "skeleton.png"), (skel * 255))
+        cv2.imwrite(str(dbg / "mask_hysteresis.png"), (hmask.astype(np.uint8) * 255))
+        cv2.imwrite(str(dbg / "mask_after_dirclose.png"), (mask * 255))
         print("[debug] prob range:", float(prob.min()), "→", float(prob.max()),
               "  mask_raw %:", round(pct0, 2),
               "  thr_used:", used_thr,
@@ -338,12 +376,12 @@ def run_kymobutler(
     # Post-process: extend ends and merge across small gaps using prob
     tracks_seg = refine_tracks(
         tracks_seg, prob,
-        extend_rows=12,         # try 8–16
-        dx_win=3,               # lateral window while extending
-        prob_min=0.12,          # min prob to keep extending
-        max_gap_rows=8,         # allow up to 8-row gaps
-        max_dx=5,               # and up to 5 px lateral offset at joins
-        prob_bridge_min=0.11,   # average prob required along the join
+        extend_rows=20,      # was 16
+        dx_win=4,
+        prob_min=0.11,
+        max_gap_rows=12,     # was 10
+        max_dx=6,
+        prob_bridge_min=0.09 # was 0.10 (slightly easier to join)
     )
     if verbose:
         lengths = [_track_len_rows(t) for t in tracks_seg]

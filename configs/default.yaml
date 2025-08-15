@@ -63,5 +63,8 @@ kymo:
   hysteresis_low: 0.08
   hysteresis_high: 0.18
 
+  fuse_uni_into_bi: true
+  fuse_uni_weight: 0.7   # 0.6–0.8 works well
+
   prune_iters: 0
 

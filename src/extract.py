@@ -289,6 +289,9 @@ def main():
     kymo_comp_min_rows = int(kymo_cfg.get('comp_min_rows', 10))
     kymo_prune_iters   = int(kymo_cfg.get('prune_iters', 3))
 
+    fuse_uni_into_bi = bool(kymo_cfg.get('fuse_uni_into_bi', True))
+    fuse_uni_weight = float(kymo_cfg.get('fuse_uni_weight', 0.7))
+
     # final save gate
     kymo_min_length = int(kymo_cfg.get('min_length', 30))
 
@@ -366,6 +369,8 @@ def main():
                 comp_min_px=kymo_comp_min_px,
                 comp_min_rows=kymo_comp_min_rows,
                 prune_iters=kymo_prune_iters,
+                fuse_uni_into_bi=fuse_uni_into_bi,
+                fuse_uni_weight=fuse_uni_weight,
             )
             out_dir = base_dir / 'kymobutler_output'
             found = sorted(out_dir.glob(track_glob))

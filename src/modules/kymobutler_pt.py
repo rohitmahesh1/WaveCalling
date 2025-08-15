@@ -9,6 +9,8 @@ import onnxruntime as ort
 
 from skimage.morphology import skeletonize as _skel, thin
 from skimage.measure import label, regionprops
+from skimage.morphology import thin as _thin
+
 
 REQUIRED_ONNX = ["uni_seg.onnx", "bi_seg.onnx", "classifier.onnx", "decision.onnx"]
 
@@ -41,9 +43,11 @@ def _resize_hw(img01: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 def prob_to_mask(prob: np.ndarray, thr: float = 0.20) -> np.ndarray:
     return (prob > thr).astype(np.uint8)
 
-def skeletonize(mask01: np.ndarray, min_component_px: int = 5) -> np.ndarray:
-    """Legacy helper: skeletonize + keep components >= min_component_px (pixels)."""
-    sk = _skel(mask01.astype(bool)).astype(np.uint8)
+def skeletonize(mask01: np.ndarray, min_component_px: int = 5, algo: str = "thin") -> np.ndarray:
+    if algo == "thin":
+        sk = _thin(mask01.astype(bool)).astype(np.uint8)
+    else:
+        sk = _skel(mask01.astype(bool)).astype(np.uint8)
     lab = label(sk, connectivity=2)
     keep = np.zeros_like(sk, dtype=np.uint8)
     for r in regionprops(lab):
@@ -83,6 +87,27 @@ def thin_and_prune(mask: np.ndarray, prune_iters: int = 3) -> np.ndarray:
         ys, xs = zip(*eps)
         sk[ys, xs] = 0
 
+    return sk
+
+def prune_endpoints(skel: np.ndarray, iterations: int = 1) -> np.ndarray:
+    sk = skel.copy().astype(np.uint8)
+    H, W = sk.shape
+    nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    for _ in range(max(0, int(iterations))):
+        ys, xs = np.where(sk == 1)
+        to_zero = []
+        for y, x in zip(ys, xs):
+            deg = 0
+            for dy, dx in nbrs:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < H and 0 <= nx < W and sk[ny, nx] == 1:
+                    deg += 1
+            if deg <= 1:  # endpoint or isolated pixel
+                to_zero.append((y, x))
+        if not to_zero:
+            break
+        for y, x in to_zero:
+            sk[y, x] = 0
     return sk
 
 def filter_components(mask: np.ndarray, min_px: int, min_rows: int) -> np.ndarray:
