@@ -7,27 +7,22 @@ from typing import List, Tuple, Optional, Dict, Iterable
 import numpy as np
 import cv2
 
-# only need the class type hint; no need to import prob_to_mask/skeletonize here
+# Only need the class type hint (and decision/preproc helper at runtime)
 from .kymobutler_pt import KymoButlerPT
 
 Coord = Tuple[int, int]  # (y, x)
 
 # 8-connected neighborhood
-_OFFSETS_8 = [(-1,-1), (-1,0), (-1,1),
-              ( 0,-1),         ( 0,1),
-              ( 1,-1), ( 1,0), ( 1,1)]
+_OFFSETS_8 = [(-1, -1), (-1, 0), (-1, 1),
+              ( 0, -1),          ( 0, 1),
+              ( 1, -1), ( 1, 0), ( 1, 1)]
 
-# Direction <-> index maps for per-edge visitation
-_DIR_TO_IDX = {d:i for i,d in enumerate(_OFFSETS_8)}
-_IDX_TO_DIR = {i:d for d,i in _DIR_TO_IDX.items()}
+# Direction -> index map for per-edge visitation
+_DIR_TO_IDX = {d: i for i, d in enumerate(_OFFSETS_8)}
 
-def _dir_idx(dy: int, dx: int) -> int:
-    return _DIR_TO_IDX[(dy, dx)]
-
-def _opp_dir_idx(idx: int) -> int:
-    dy, dx = _IDX_TO_DIR[idx]
-    oy, ox = -dy, -dx
-    return _DIR_TO_IDX[(oy, ox)]
+# ---------------------------
+# Small pixel-graph utilities
+# ---------------------------
 
 def neighbors8(y: int, x: int, H: int, W: int) -> Iterable[Coord]:
     for dy, dx in _OFFSETS_8:
@@ -40,7 +35,6 @@ def degree_at(skel: np.ndarray, y: int, x: int) -> int:
     return sum(1 for ny, nx in neighbors8(y, x, H, W) if skel[ny, nx] == 1)
 
 def find_endpoints_and_junctions(skel: np.ndarray) -> Tuple[List[Coord], List[Coord]]:
-    H, W = skel.shape
     endpoints, junctions = [], []
     ys, xs = np.where(skel == 1)
     for y, x in zip(ys, xs):
@@ -52,6 +46,7 @@ def find_endpoints_and_junctions(skel: np.ndarray) -> Tuple[List[Coord], List[Co
     return endpoints, junctions
 
 def crop_with_pad(arr: np.ndarray, cy: int, cx: int, hh: int, hw: int) -> np.ndarray:
+    """Center crop with zero-padding if window runs off the borders."""
     H, W = arr.shape[:2]
     y0, y1 = cy - hh, cy + hh
     x0, x1 = cx - hw, cx + hw
@@ -61,23 +56,29 @@ def crop_with_pad(arr: np.ndarray, cy: int, cx: int, hh: int, hw: int) -> np.nda
     pad_right = max(0, x1 - W + 1)
     y0c, y1c = max(0, y0), min(H - 1, y1)
     x0c, x1c = max(0, x0), min(W - 1, x1)
-    crop = arr[y0c:y1c+1, x0c:x1c+1]
+    crop = arr[y0c:y1c + 1, x0c:x1c + 1]
     if pad_top or pad_bot or pad_left or pad_right:
-        crop = np.pad(crop, ((pad_top, pad_bot), (pad_left, pad_right)),
-                      mode="constant", constant_values=0)
+        crop = np.pad(
+            crop,
+            ((pad_top, pad_bot), (pad_left, pad_right)),
+            mode="constant",
+            constant_values=0,
+        )
     return crop
 
-def path_mask(shape: Tuple[int,int], pts: List[Coord], radius: int = 0) -> np.ndarray:
+def path_mask(shape: Tuple[int, int], pts: List[Coord], radius: int = 0) -> np.ndarray:
+    """Binary mask from a list of points; optional dilation radius to provide a corridor."""
     m = np.zeros(shape, dtype=np.uint8)
     if pts:
         ys, xs = zip(*pts)
         m[ys, xs] = 1
     if radius > 0:
-        k = 2*radius + 1
+        k = 2 * radius + 1
         m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     return m
 
 def enforce_one_point_per_row(track: List[Coord]) -> List[Coord]:
+    """Collapse any multi-pixel rows to a single x (median for the first row, then nearest to previous)."""
     if not track:
         return track
     rows: Dict[int, List[int]] = {}
@@ -96,14 +97,30 @@ def enforce_one_point_per_row(track: List[Coord]) -> List[Coord]:
         prev_x = x
     return cleaned
 
+def _norm01(img: np.ndarray) -> np.ndarray:
+    f = img.astype(np.float32)
+    if f.max() > 1:
+        f /= 255.0
+    return np.clip(f, 0.0, 1.0)
+
+
+# ---------------------------
+# Data class
+# ---------------------------
+
 @dataclass
 class Track:
     points: List[Coord]
     id: int
 
+
+# ---------------------------
+# Crossing-aware tracker (edge-visited)
+# ---------------------------
+
 class CrossingTracker:
     def __init__(self, kb: KymoButlerPT,
-                 decision_crop_hw: Tuple[int,int]=(48,48),
+                 decision_crop_hw: Tuple[int, int] = (48, 48),
                  max_branch_steps: int = 64,
                  min_track_len: int = 8,
                  decision_recent_tail: int = 12,
@@ -116,12 +133,12 @@ class CrossingTracker:
         """
         self.kb = kb
         self.ch, self.cw = decision_crop_hw
-        self.max_branch_steps = max_branch_steps
-        self.min_track_len = min_track_len
-        self.decision_recent_tail = decision_recent_tail
-        self.decision_thr = decision_thr
-        self.seed_interior = seed_interior
-        self.max_iters = max_iters
+        self.max_branch_steps = int(max_branch_steps)
+        self.min_track_len = int(min_track_len)
+        self.decision_recent_tail = int(decision_recent_tail)
+        self.decision_thr = float(decision_thr)
+        self.seed_interior = bool(seed_interior)
+        self.max_iters = int(max_iters)
         self._raw01_cache: Optional[np.ndarray] = None  # set per extract() call
 
     # -------- edge-visited helpers --------
@@ -130,7 +147,7 @@ class CrossingTracker:
         dy, dx = ny - y, nx - x
         if (dy, dx) not in _DIR_TO_IDX:
             return True
-        idx = _dir_idx(dy, dx)
+        idx = _DIR_TO_IDX[(dy, dx)]
         return visited_edge[y, x, idx] == 1
 
     @staticmethod
@@ -138,8 +155,8 @@ class CrossingTracker:
         dy, dx = ny - y, nx - x
         if (dy, dx) not in _DIR_TO_IDX:
             return
-        i1 = _dir_idx(dy, dx)
-        i2 = _opp_dir_idx(i1)
+        i1 = _DIR_TO_IDX[(dy, dx)]
+        i2 = _DIR_TO_IDX[(-dy, -dx)]
         visited_edge[y, x, i1] = 1
         visited_edge[ny, nx, i2] = 1
 
@@ -147,6 +164,7 @@ class CrossingTracker:
     def _score_branches(self, raw01: np.ndarray, skel_all: np.ndarray,
                         curr_pts: List[Coord], junction: Coord,
                         cand_starts: List[Coord]) -> Optional[Coord]:
+        """Score candidate branch starts using the decision map; return the best (or None)."""
         H, W = raw01.shape
         jy, jx = junction
         tail_pts = curr_pts[-self.decision_recent_tail:] if curr_pts else []
@@ -156,6 +174,7 @@ class CrossingTracker:
         crop_all  = crop_with_pad(skel_all, jy, jx, hh, hw)
         crop_curr = crop_with_pad(curr_mask, jy, jx, hh, hw)
         prob = self.kb.decision_map(crop_raw, crop_all, crop_curr)  # [Hc,Wc] in 0..1
+
         best_start, best_score = None, -1.0
         for sy, sx in cand_starts:
             branch_pts = self._walk_branch_preview(skel_all, junction, (sy, sx), self.max_branch_steps)
@@ -175,6 +194,7 @@ class CrossingTracker:
 
     def _walk_branch_preview(self, skel: np.ndarray, prev: Coord,
                              start: Coord, max_steps: int) -> List[Coord]:
+        """Preview a corridor from 'start' until junction/end or max_steps."""
         H, W = skel.shape
         path: List[Coord] = []
         prev_y, prev_x = prev
@@ -244,7 +264,7 @@ class CrossingTracker:
                     vy, vx = y - prev_y, x - prev_x
                     def straightness(n):
                         dy, dx = n[0] - y, n[1] - x
-                        return -(vy*dy + vx*dx)
+                        return -(vy * dy + vx * dx)
                     ny, nx = min(nbrs, key=straightness)
                 else:
                     ny, nx = chosen
@@ -360,7 +380,7 @@ class CrossingTracker:
             tracks.extend(new_tracks)
             remaining = self._subtract_tracks(remaining, new_tracks)
 
-            # done if nothing left
+            # Done if nothing left
             if int(remaining.sum()) <= 0:
                 break
 
@@ -368,6 +388,7 @@ class CrossingTracker:
         self._raw01_cache = None
         return tracks
 
+    # -------- utility I/O --------
     @staticmethod
     def save_tracks_csv(tracks: List[Track], out_csv: str):
         os.makedirs(os.path.dirname(out_csv), exist_ok=True)
@@ -377,9 +398,3 @@ class CrossingTracker:
             for t in tracks:
                 for (y, x) in t.points:
                     w.writerow([t.id, y, x])
-
-def _norm01(img: np.ndarray) -> np.ndarray:
-    f = img.astype(np.float32)
-    if f.max() > 1:
-        f /= 255.0
-    return np.clip(f, 0, 1)

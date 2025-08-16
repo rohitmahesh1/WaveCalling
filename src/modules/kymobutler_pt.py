@@ -1,19 +1,25 @@
 # src/modules/kymobutler_pt.py  (ORT backend with WL-like preprocessing + skeleton helpers)
 
 import os
+import math
 from pathlib import Path
+
 import cv2
 import numpy as np
 import onnx
 import onnxruntime as ort
-import math
 
-from skimage.morphology import skeletonize as _skel, thin
-from skimage.measure import label, regionprops
+from skimage.morphology import skeletonize as _skel
 from skimage.morphology import thin as _thin
+from skimage.measure import label, regionprops
 
 
 REQUIRED_ONNX = ["uni_seg.onnx", "bi_seg.onnx", "classifier.onnx", "decision.onnx"]
+
+
+# ---------------------------
+# Paths / I/O helpers
+# ---------------------------
 
 def _find_export_dir(user_path=None) -> Path:
     if user_path is not None:
@@ -31,6 +37,11 @@ def _find_export_dir(user_path=None) -> Path:
             return c
     raise FileNotFoundError("Could not locate ONNX export directory. Set KYMO_EXPORT_DIR or pass export_dir.")
 
+
+# ---------------------------
+# Basic image helpers
+# ---------------------------
+
 def _to_01_gray(img: np.ndarray) -> np.ndarray:
     g = img.astype(np.float32)
     if g.max() > 1.0:
@@ -44,7 +55,13 @@ def _resize_hw(img01: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 def prob_to_mask(prob: np.ndarray, thr: float = 0.20) -> np.ndarray:
     return (prob > thr).astype(np.uint8)
 
+
+# ---------------------------
+# Skeleton helpers (WL-parity)
+# ---------------------------
+
 def skeletonize(mask01: np.ndarray, min_component_px: int = 5, algo: str = "thin") -> np.ndarray:
+    """Binary mask -> 1px skeleton + small component filter."""
     if algo == "thin":
         sk = _thin(mask01.astype(bool)).astype(np.uint8)
     else:
@@ -63,7 +80,7 @@ def thin_and_prune(mask: np.ndarray, prune_iters: int = 3) -> np.ndarray:
     1) Thin to 1-px skeleton.
     2) Iteratively remove endpoints 'prune_iters' times.
     """
-    sk = thin(mask.astype(bool)).astype(np.uint8)
+    sk = _thin(mask.astype(bool)).astype(np.uint8)
 
     H, W = sk.shape
     nb = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
@@ -126,6 +143,11 @@ def filter_components(mask: np.ndarray, min_px: int, min_rows: int) -> np.ndarra
             keep[yy, xx] = 1
     return keep
 
+
+# ---------------------------
+# Math helpers
+# ---------------------------
+
 def _softmax(x, axis=-1):
     x = x - np.max(x, axis=axis, keepdims=True)
     e = np.exp(x)
@@ -141,7 +163,11 @@ def _as_prob(y: np.ndarray) -> np.ndarray:
         return y.astype(np.float32, copy=False)
     return _sigmoid(y).astype(np.float32, copy=False)
 
-# --- WL-like preprocessing: isNegated + normlines ---
+
+# ---------------------------
+# WL-like preprocessing
+# ---------------------------
+
 def _is_negated_like_wl(img01: np.ndarray) -> bool:
     # WL: n1 = Total@Binarize[kym, .5], n2 = Total@Binarize[ColorNegate@kym, .5]; n1>=n2 => invert
     gt = (img01 > 0.5).sum()
@@ -169,6 +195,11 @@ def _preproc_like_wl(img_gray: np.ndarray) -> np.ndarray:
     x = _normlines_like_wl(x)
     return x
 
+
+# ---------------------------
+# Tiling / blending helpers
+# ---------------------------
+
 def _round_up(v, base):
     return int(base * math.ceil(float(v) / base))
 
@@ -188,15 +219,24 @@ def _ensure_min_hw(img01: np.ndarray, min_h: int, min_w: int) -> np.ndarray:
         return img01
     return cv2.resize(img01, (max(min_w, w), max(min_h, h)), interpolation=cv2.INTER_CUBIC)
 
+
+# ---------------------------
+# ORT thin wrapper
+# ---------------------------
+
 class ORTModel:
-    def __init__(self, path: str):
+    def __init__(self, path: str, providers=None):
         self.path = str(path)
         self.model = onnx.load(self.path)
         self.init_names = {init.name for init in self.model.graph.initializer}
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.sess = ort.InferenceSession(self.path, sess_options=so, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(
+            self.path,
+            sess_options=so,
+            providers=(providers or ["CPUExecutionProvider"]),
+        )
 
         self.inputs_meta = self.sess.get_inputs()
         self.outputs = [o.name for o in self.sess.get_outputs()]
@@ -258,12 +298,18 @@ class ORTModel:
         outs = self.sess.run(self.outputs, feed)
         return {name: arr for name, arr in zip(self.outputs, outs)}
 
+
+# ---------------------------
+# Main ONNX runner
+# ---------------------------
+
 class KymoButlerPT:
     """ORT-based runner for KymoButler ONNX models, with WL-like preprocessing."""
     def __init__(self, export_dir=None, seg_size=256,
                  tile_stride: int = 128,    # overlap = seg_size - stride
                  tile_round_to: int = 16,   # round full-res canvas to multiple of this
-                 use_tiling: bool = True):
+                 use_tiling: bool = True,
+                 providers=None):
         export_dir = _find_export_dir(export_dir)
         paths = {
             k: export_dir / f
@@ -277,10 +323,11 @@ class KymoButlerPT:
         missing = [k for k, p in paths.items() if not Path(p).exists()]
         if missing:
             raise FileNotFoundError(f"Missing ONNX files for {missing}. Looked in: {export_dir}")
-        self.uni = ORTModel(paths["uni"])
-        self.bi = ORTModel(paths["bi"])
-        self.clf = ORTModel(paths["clf"])
-        self.dec = ORTModel(paths["dec"])
+
+        self.uni = ORTModel(paths["uni"], providers=providers)
+        self.bi  = ORTModel(paths["bi"],  providers=providers)
+        self.clf = ORTModel(paths["clf"], providers=providers)
+        self.dec = ORTModel(paths["dec"], providers=providers)
 
         # ONNX input tile size (fixed by export)
         self.seg_hw = (int(seg_size), int(seg_size))
@@ -388,10 +435,12 @@ class KymoButlerPT:
         else:
             ant_full = acc_ant / np.maximum(wsum, eps)
             ret_full = acc_ret / np.maximum(wsum, eps)
-            return {"ant": ant_full[:H, :W].astype(np.float32),
-                    "ret": ret_full[:H, :W].astype(np.float32)}
+            return {
+                "ant": ant_full[:H, :W].astype(np.float32),
+                "ret": ret_full[:H, :W].astype(np.float32),
+            }
 
-    # ========== CLASSIFIER / DECISION (unchanged) ==========
+    # ========== CLASSIFIER / DECISION ==========
     def classify(self, img_gray: np.ndarray) -> dict:
         x = self._prep_gray(img_gray, self.clf_hw, wl_preproc=True)
         out = self.clf.run(x)
@@ -417,24 +466,25 @@ class KymoButlerPT:
             raise RuntimeError(f"Unexpected decision output shape: {y.shape}")
         return prob.astype(np.float32)
 
-    # ========== FULL-RES SEGMENTATION (Phase A) ==========
-    def segment_bi_full(self, img_gray: np.ndarray) -> np.ndarray:
+    # ========== FULL-RES SEGMENTATION ==========
+    def segment_bi_full(self, img_gray: np.ndarray, *, crop_to_original: bool = True) -> np.ndarray:
         """
         Full-resolution bidirectional segmentation with tiling/blending.
-        Returns prob map with size ≈ original (rounded to tile_round_to).
+        Returns prob map at original size (if crop_to_original=True).
         """
         img01 = _preproc_like_wl(img_gray)
-        # (Optionally) allow disabling tiling for 256×256 behavior
         if not self.use_tiling:
             x = self._prep_gray(img_gray, self.bi_hw, wl_preproc=True)
             out = self.bi.run(x)
             y = list(out.values())[0]
             y = np.squeeze(y)
-            return _as_prob(y).astype(np.float32)
+            prob = _as_prob(y).astype(np.float32)
+            if crop_to_original:
+                H0, W0 = img01.shape
+                return cv2.resize(prob, (W0, H0), interpolation=cv2.INTER_LINEAR)
+            return prob
 
-        # Prepare a canvas ~native resolution
         H0, W0 = img01.shape
-        # Ensure minimum = tile size; round to multiple for stable coverage
         Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
         Wt = max(self.seg_hw[1], _round_up(W0, self.tile_round_to))
         img01r = cv2.resize(img01, (Wt, Ht), interpolation=cv2.INTER_AREA)
@@ -443,28 +493,35 @@ class KymoButlerPT:
             return self.bi.run(tile_nchw)
 
         prob = self._tile_infer_2d(img01r, _run, out_kind="bi")
-        return prob  # (Ht, Wt)
+        return prob[:H0, :W0] if crop_to_original else prob
 
-    def segment_uni_full(self, img_gray: np.ndarray) -> dict:
+    def segment_uni_full(self, img_gray: np.ndarray, *, crop_to_original: bool = True) -> dict:
         """
         Full-resolution unidirectional segmentation with tiling/blending.
-        Returns dict {'ant': HxW, 'ret': HxW}.
+        Returns dict {'ant': HxW, 'ret': HxW} (cropped if crop_to_original=True).
         """
         img01 = _preproc_like_wl(img_gray)
         if not self.use_tiling:
             x = self._prep_gray(img_gray, self.uni_hw, wl_preproc=True)
             out = self.uni.run(x)
             if "ant" in out and "ret" in out:
-                return {"ant": _as_prob(out["ant"]).squeeze().astype(np.float32),
-                        "ret": _as_prob(out["ret"]).squeeze().astype(np.float32)}
-            y = list(out.values())[0]
-            if y.ndim == 4 and y.shape[1] == 2:
-                return {"ant": _as_prob(y[:, 0]).squeeze().astype(np.float32),
-                        "ret": _as_prob(y[:, 1]).squeeze().astype(np.float32)}
-            elif y.ndim == 4 and y.shape[-1] == 2:
-                return {"ant": _as_prob(y[..., 0]).squeeze().astype(np.float32),
-                        "ret": _as_prob(y[..., 1]).squeeze().astype(np.float32)}
-            raise RuntimeError(f"Unexpected uni_seg output shape: {y.shape}")
+                ant = _as_prob(out["ant"]).squeeze().astype(np.float32)
+                ret = _as_prob(out["ret"]).squeeze().astype(np.float32)
+            else:
+                y = list(out.values())[0]
+                if y.ndim == 4 and y.shape[1] == 2:
+                    ant = _as_prob(y[:, 0]).squeeze().astype(np.float32)
+                    ret = _as_prob(y[:, 1]).squeeze().astype(np.float32)
+                elif y.ndim == 4 and y.shape[-1] == 2:
+                    ant = _as_prob(y[..., 0]).squeeze().astype(np.float32)
+                    ret = _as_prob(y[..., 1]).squeeze().astype(np.float32)
+                else:
+                    raise RuntimeError(f"Unexpected uni_seg output shape: {y.shape}")
+            if crop_to_original:
+                H0, W0 = img01.shape
+                ant = cv2.resize(ant, (W0, H0), interpolation=cv2.INTER_LINEAR)
+                ret = cv2.resize(ret, (W0, H0), interpolation=cv2.INTER_LINEAR)
+            return {"ant": ant, "ret": ret}
 
         H0, W0 = img01.shape
         Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
@@ -475,7 +532,12 @@ class KymoButlerPT:
             return self.uni.run(tile_nchw)
 
         out_full = self._tile_infer_2d(img01r, _run, out_kind="uni")
-        return out_full  # {'ant':(Ht,Wt), 'ret':(Ht,Wt)}
+        if crop_to_original:
+            return {
+                "ant": out_full["ant"][:H0, :W0],
+                "ret": out_full["ret"][:H0, :W0],
+            }
+        return out_full
 
     # ========== LEGACY (kept for compatibility) ==========
     def segment_bi(self, img_gray: np.ndarray) -> np.ndarray:

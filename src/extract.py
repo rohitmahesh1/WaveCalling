@@ -3,10 +3,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# kymo interface (Mathematica/WolframScript wrappers)
-# from .modules.kymo_interface import run_kymobutler  # (use for Mathematica scripts)
-from .modules.kb_adapter import run_kymobutler
-
 # signal-processing modules (package-relative)
 from .signal.detrend import detrend_residual
 from .signal.peaks import detect_peaks
@@ -206,6 +202,149 @@ def process_track(
     return track_metrics, wave_rows
 
 
+# -----------------------
+# Backend selection utils
+# -----------------------
+def _cfg_get(dct, path, default=None):
+    """Safe nested get: path is list/tuple of keys."""
+    cur = dct
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _build_kymo_runner(cfg, log, verbose):
+    """
+    Returns (run_kymo_callable, kwargs_dict, backend_name_str)
+    based on cfg['kymo'].
+    """
+    kymo_cfg = cfg.get('kymo', {}) or {}
+
+    backend = str(kymo_cfg.get('backend', 'onnx')).lower()
+    if backend not in ('onnx', 'wolfram'):
+        log.warning(f"Unknown kymo.backend={backend!r}; defaulting to 'onnx'")
+        backend = 'onnx'
+
+    if backend == 'wolfram':
+        # Wolfram backend (Mathematica scripts)
+        from .modules.kymo_interface import run_kymobutler as _runner
+        # WL runner usually just needs min_length & verbose; keep future-proof kwargs minimal
+        min_len = (
+            _cfg_get(kymo_cfg, ['onx', 'tracking', 'min_length']) or
+            kymo_cfg.get('min_length') or
+            30
+        )
+        kwargs = dict(
+            min_length=int(min_len),
+            verbose=bool(verbose),
+        )
+        return _runner, kwargs, 'wolfram'
+
+    # ONNX backend
+    from .modules.kb_adapter import run_kymobutler as _runner
+
+    onnx_cfg = kymo_cfg.get('onnx', {}) or {}
+
+    # Model / segmentation
+    export_dir   = onnx_cfg.get('export_dir', None)
+    seg_size     = int(onnx_cfg.get('seg_size', 256))
+    force_mode   = onnx_cfg.get('force_mode', None)  # "uni"|"bi"|None
+
+    # Fuse uni into bi
+    fuse_uni_into_bi = bool(onnx_cfg.get('fuse_uni_into_bi', True))
+    fuse_uni_weight  = float(onnx_cfg.get('fuse_uni_weight', 0.7))
+
+    # Thresholds
+    thr_cfg  = onnx_cfg.get('thresholds', {}) or {}
+    thr      = float(thr_cfg.get('thr_default', 0.20))
+    thr_bi   = thr_cfg.get('thr_bi', None)
+    thr_uni  = thr_cfg.get('thr_uni', None)
+
+    # Auto threshold
+    auto_cfg = onnx_cfg.get('auto_threshold', {}) or {}
+    auto_threshold   = bool(auto_cfg.get('enabled', True))
+    auto_sweep       = tuple(auto_cfg.get('sweep', [0.12, 0.30, 19]))
+    auto_target_pct  = tuple(auto_cfg.get('target_mask_pct', [15.0, 25.0]))
+    auto_trigger_pct = tuple(auto_cfg.get('trigger_pct', [5.0, 35.0]))
+
+    # Hysteresis
+    hyst_cfg = onnx_cfg.get('hysteresis', {}) or {}
+    hysteresis_enable = bool(hyst_cfg.get('enabled', True))
+    hysteresis_low    = float(hyst_cfg.get('low', 0.08))
+    hysteresis_high   = float(hyst_cfg.get('high', 0.18))
+
+    # Morphology
+    morph = onnx_cfg.get('morphology', {}) or {}
+    morph_mode = str(morph.get('mode', 'directional'))
+    morph_close_open_close = (morph_mode == 'classic')
+    directional_close      = (morph_mode == 'directional')
+    # directional kernel sizes (optional)
+    dir_kv = int(_cfg_get(morph, ['directional', 'kv'], 5))
+    dir_kh = int(_cfg_get(morph, ['directional', 'kh'], 5))
+    diag_bridge = bool(_cfg_get(morph, ['directional', 'diag_bridge'], True))
+    # classic kernel (unused here; adapter uses fixed 3x3 ellipse)
+    _ = morph.get('classic', {})
+
+    # Components
+    comp = onnx_cfg.get('components', {}) or {}
+    comp_min_px   = int(comp.get('min_px', 5))
+    comp_min_rows = int(comp.get('min_rows', 5))
+
+    # Skeleton
+    skel = onnx_cfg.get('skeleton', {}) or {}
+    prune_iters = int(skel.get('prune_iters', 0))
+    # keep_ratio, keep_min_px, floors are currently handled inside adapter; skip here
+
+    # Tracking
+    track = onnx_cfg.get('tracking', {}) or {}
+    min_length = int(track.get('min_length', 30))
+    # other tracking knobs are internal to adapter/tracker
+
+    # Build kwargs for kb_adapter.run_kymobutler (only pass what it supports)
+    kwargs = dict(
+        min_length=min_length,
+        verbose=bool(verbose),
+        export_dir=export_dir,
+        seg_size=seg_size,
+        thr=thr,
+        # legacy compat (some code still reads this name)
+        min_component_px=comp_min_px,
+
+        # mode & per-mode thresholds
+        force_mode=force_mode,
+        thr_uni=thr_uni,
+        thr_bi=thr_bi,
+
+        # morphology & components
+        morph_close_open_close=morph_close_open_close,
+        directional_close=directional_close,
+        comp_min_px=comp_min_px,
+        comp_min_rows=comp_min_rows,
+        prune_iters=prune_iters,
+
+        # auto-thresholding & hysteresis
+        auto_threshold=auto_threshold,
+        auto_sweep=auto_sweep,
+        auto_target_pct=auto_target_pct,
+        auto_trigger_pct=auto_trigger_pct,
+        hysteresis_enable=hysteresis_enable,
+        hysteresis_low=hysteresis_low,
+        hysteresis_high=hysteresis_high,
+
+        # fusion
+        fuse_uni_into_bi=fuse_uni_into_bi,
+        fuse_uni_weight=fuse_uni_weight,
+
+        # optional directional kernel hints (adapter may read them if implemented)
+        dir_kv=dir_kv,
+        dir_kh=dir_kh,
+        diag_bridge=diag_bridge,
+    )
+    return _runner, kwargs, 'onnx'
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract wave characteristics from KymoButler outputs"
@@ -271,30 +410,6 @@ def main():
     hist_bins = int(viz_cfg.get('hist_bins', 20))
     dpi = int(viz_cfg.get('dpi', 180))
 
-    # --- KymoButler (ONNX) runtime config ---
-    kymo_cfg = cfg.get('kymo', {})
-    kymo_export_dir = kymo_cfg.get('export_dir', None)
-    kymo_force_mode = kymo_cfg.get('force_mode', 'bi')  # bi matches WL behavior
-    kymo_seg_size   = int(kymo_cfg.get('seg_size', 256))
-
-    # thresholds
-    kymo_thr       = float(kymo_cfg.get('thr', 0.20))
-    kymo_thr_uni   = kymo_cfg.get('thr_uni', None)
-    kymo_thr_bi    = kymo_cfg.get('thr_bi', None)
-
-    # WL-like shaping
-    kymo_morph_coc     = bool(kymo_cfg.get('morph_close_open_close', True))
-    kymo_min_comp_px   = int(kymo_cfg.get('min_component_px', 5))  # legacy compat
-    kymo_comp_min_px   = int(kymo_cfg.get('comp_min_px', 10))
-    kymo_comp_min_rows = int(kymo_cfg.get('comp_min_rows', 10))
-    kymo_prune_iters   = int(kymo_cfg.get('prune_iters', 3))
-
-    fuse_uni_into_bi = bool(kymo_cfg.get('fuse_uni_into_bi', True))
-    fuse_uni_weight = float(kymo_cfg.get('fuse_uni_weight', 0.7))
-
-    # final save gate
-    kymo_min_length = int(kymo_cfg.get('min_length', 30))
-
     input_path = Path(args.input_dir)
 
     # determine plotting directory (requires CLI flag and viz.enabled)
@@ -305,6 +420,10 @@ def main():
             log.info(f'Plot outputs will be written to {plots_dir}')
         else:
             log.info('viz.enabled is False in config; skipping plot generation despite --plots-out')
+
+    # Choose backend runner + kwargs from YAML
+    run_kymo, run_kwargs, backend = _build_kymo_runner(cfg, log, args.verbose)
+    log.info(f"Using KymoButler backend: {backend}")
 
     # discover existing track arrays first
     npy_files = list(input_path.rglob(track_glob))
@@ -354,24 +473,7 @@ def main():
         arr_paths = []
         for img in all_images:
             log.debug(f'Running KymoButler on {img}...')
-            base_dir = run_kymobutler(
-                str(img),
-                min_length=kymo_min_length,
-                verbose=args.verbose,
-                export_dir=kymo_export_dir,
-                seg_size=kymo_seg_size,
-                thr=kymo_thr,
-                min_component_px=kymo_min_comp_px,
-                force_mode=kymo_force_mode,
-                thr_uni=kymo_thr_uni,
-                thr_bi=kymo_thr_bi,
-                morph_close_open_close=kymo_morph_coc,
-                comp_min_px=kymo_comp_min_px,
-                comp_min_rows=kymo_comp_min_rows,
-                prune_iters=kymo_prune_iters,
-                fuse_uni_into_bi=fuse_uni_into_bi,
-                fuse_uni_weight=fuse_uni_weight,
-            )
+            base_dir = run_kymo(str(img), **run_kwargs)
             out_dir = base_dir / 'kymobutler_output'
             found = sorted(out_dir.glob(track_glob))
             log.debug(f"{Path(img).name}: found {len(found)} tracks")

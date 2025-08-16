@@ -5,7 +5,7 @@ io:
   sampling_rate: 5.0
   image_globs: ["*.png", "*.jpg", "*.jpeg"]
   track_glob: "*.npy"
-  table_globs: ["*.csv", "*.tsv", "*.xls", "*.xlsx"]   # <- NEW
+  table_globs: ["*.csv", "*.tsv", "*.xls", "*.xlsx"]
 
 heatmap:
   lower: -1e20
@@ -40,31 +40,82 @@ viz:
   hist_bins: 20
   dpi: 180
 
+# ----------------------------------------------------
+# KymoButler pipeline configuration
+# ----------------------------------------------------
 kymo:
-  force_mode: bi
-  seg_size: 256
+  # Choose backend: "onnx" (Python/ONNXRuntime) or "wolfram" (Mathematica scripts)
+  backend: onnx
 
-  # thresholds
-  thr: 0.20
-  thr_bi: 0.18       # (was effectively 0.35)
-  thr_uni: 0.20
+  # ---------------- ONNX backend options ----------------
+  onnx:
+    # Model & classification/seg behavior
+    export_dir: null          # null => auto-discover export/
+    seg_size: 256
+    force_mode: bi            # "uni" | "bi" | null (null => use classifier)
+    fuse_uni_into_bi: true
+    fuse_uni_weight: 0.7      # 0.6–0.8 works well
 
-  # WL-like mask→skeleton shaping
-  morph_close_open_close: true
-  comp_min_px: 5       # relax from 10
-  comp_min_rows: 5     # relax from 10
-  prune_iters: 2       # relax from 3
+    # Thresholding
+    thresholds:
+      thr_default: 0.20
+      thr_bi: 0.18
+      thr_uni: 0.20
+    auto_threshold:
+      enabled: true
+      sweep: [0.12, 0.30, 19]         # [lo, hi, N]
+      target_mask_pct: [15.0, 25.0]   # desired mask density band
+      trigger_pct: [5.0, 35.0]        # only auto-tune if outside this band
+    hysteresis:
+      enabled: true
+      low: 0.08
+      high: 0.18
 
-  # tracking / save
-  min_length: 30
+    # Mask → skeleton shaping
+    morphology:
+      mode: directional        # "directional" | "classic" | "none"
+      directional:
+        kv: 5                  # vertical close kernel height (1xkv)
+        kh: 5                  # horizontal close kernel width (khx1)
+        diag_bridge: true      # apply 3x3 diagonal bridging close
+      classic:
+        kernel: 3              # 3x3 ellipse; close→open→close
 
-  # bridges weak segments
-  hysteresis_enable: true
-  hysteresis_low: 0.08
-  hysteresis_high: 0.18
+    components:
+      min_px: 5                # drop tiny blobs before skeletonization
+      min_rows: 5
 
-  fuse_uni_into_bi: true
-  fuse_uni_weight: 0.7   # 0.6–0.8 works well
+    skeleton:
+      method: thin             # "thin" | "zhangsuen"
+      prune_iters: 0           # WL Pruning[..., k]
+      keep_ratio: 0.60         # adaptive corridor keep ratio (0..1)
+      keep_min_px: 2000        # absolute min pixels to keep
+      prob_floor_min: 0.06     # clamp p10 floor lower bound
+      prob_floor_max: 0.10     # clamp p10 floor upper bound
 
-  prune_iters: 0
+    # Tracking & post-processing
+    tracking:
+      min_length: 30
+      max_branch_steps: 256
+      decision_recent_tail: 16
 
+    postproc:
+      extend_rows: 22
+      dx_win: 4
+      prob_min: 0.11
+      max_gap_rows: 13
+      max_dx: 6
+      prob_bridge_min: 0.11
+      dedupe:
+        enabled: true
+        min_rows: 30
+        min_score: 0.11
+        overlap_iou: 0.80
+        dx_tol: 2.5
+
+    debug:
+      save_debug_images: true
+
+  # ---------------- Wolfram backend options ----------------
+  wolfram:
+    scripts_dir: kymobutler_scripts
