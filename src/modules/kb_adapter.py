@@ -22,6 +22,68 @@ from .tracker import CrossingTracker, Track, enforce_one_point_per_row
 # Small utilities
 # ---------------------------
 
+def _track_score(prob: np.ndarray, t) -> float:
+    """Median prob along track (robust to a few weak pixels)."""
+    if not t.points: return 0.0
+    ys, xs = zip(*t.points)
+    return float(np.median(prob[tuple(np.array(ys)), tuple(np.array(xs))]))
+
+def _row_overlap(a_pts, b_pts) -> float:
+    """Fraction of overlapped rows between two y-sorted tracks."""
+    ay = {y for y,_ in a_pts}
+    by = {y for y,_ in b_pts}
+    if not ay or not by: return 0.0
+    inter = len(ay & by)
+    return inter / float(min(len(ay), len(by)))
+
+def _mean_dx_on_overlap(a_pts, b_pts) -> float:
+    """Mean |dx| where rows overlap (nearest x if multiple per row)."""
+    from collections import defaultdict
+    ax = defaultdict(list); bx = defaultdict(list)
+    for y,x in a_pts: ax[y].append(x)
+    for y,x in b_pts: bx[y].append(x)
+    ys = sorted(set(ax) & set(bx))
+    if not ys: return 1e9
+    diffs = []
+    for y in ys:
+        xa = min(ax[y], key=lambda v: abs(v - np.median(ax[y])))
+        xb = min(bx[y], key=lambda v: abs(v - np.median(bx[y])))
+        diffs.append(abs(xa - xb))
+    return float(np.mean(diffs)) if diffs else 1e9
+
+def filter_and_dedupe_tracks(tracks, prob,
+                             min_rows=30,           # same as save gate, or looser
+                             min_score=0.11,        # prob floor for acceptance
+                             overlap_iou=0.80,      # row-coverage threshold to consider duplicates
+                             dx_tol=2.5):           # average pixel distance on overlaps
+    """Keep strong tracks, remove near-duplicates (keep the stronger by score)."""
+    # precompute score/length
+    enriched = []
+    for t in tracks:
+        pts = sorted(t.points, key=lambda p: (p[0], p[1]))
+        if len(pts) < min_rows: 
+            continue
+        score = _track_score(prob, t)
+        if score < min_score:
+            continue
+        enriched.append((t, pts, score, len(pts)))
+
+    # sort by score desc then length desc
+    enriched.sort(key=lambda z: (z[2], z[3]), reverse=True)
+
+    kept = []
+    for t, pts, score, _ in enriched:
+        dup = False
+        for kt, kpts, kscore, _ in kept:
+            ov = _row_overlap(pts, kpts)
+            if ov >= overlap_iou and _mean_dx_on_overlap(pts, kpts) <= dx_tol:
+                dup = True
+                break
+        if not dup:
+            kept.append((t, pts, score, _))
+
+    return [z[0] for z in kept]
+
 # --- graph / skeleton helpers (adaptive cleaning) ---
 _OFFSETS_8 = [(-1,-1), (-1,0), (-1,1),
               ( 0,-1),         ( 0,1),
@@ -551,6 +613,16 @@ def run_kymobutler(
         max_dx=6,
         prob_bridge_min=0.11
     )
+
+    # quality filter + dedupe
+    tracks_seg = filter_and_dedupe_tracks(
+        tracks_seg, prob,
+        min_rows=min_length,        # match save gate
+        min_score=0.11,             # tune between 0.10–0.14
+        overlap_iou=0.80,
+        dx_tol=2.5
+    )
+
     if verbose and tracks_seg:
         lengths = [_track_len_rows(t) for t in tracks_seg]
         print(f"[debug] track rows: n={len(lengths)}  "
