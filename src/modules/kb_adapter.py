@@ -22,6 +22,84 @@ from .tracker import CrossingTracker, Track, enforce_one_point_per_row
 # Small utilities
 # ---------------------------
 
+# --- graph / skeleton helpers (adaptive cleaning) ---
+_OFFSETS_8 = [(-1,-1), (-1,0), (-1,1),
+              ( 0,-1),         ( 0,1),
+              ( 1,-1), ( 1,0), ( 1,1)]
+
+def _neighbors8(y, x, H, W):
+    for dy, dx in _OFFSETS_8:
+        ny, nx = y + dy, x + dx
+        if 0 <= ny < H and 0 <= nx < W:
+            yield ny, nx
+
+def _degree_map(skel: np.ndarray) -> np.ndarray:
+    """3x3 neighbor count (degree) for binary skeleton."""
+    k = np.ones((3, 3), np.uint8)
+    k[1, 1] = 0
+    # cv2.filter2D with uint8 is fine here; result ≤ 8
+    deg = cv2.filter2D(skel.astype(np.uint8), ddepth=cv2.CV_8U, kernel=k, borderType=cv2.BORDER_CONSTANT)
+    return deg
+
+def _spur_prune_by_len(skel: np.ndarray, max_len: int = 5) -> np.ndarray:
+    """Remove endpoint→junction twigs of length ≤ max_len (iterative)."""
+    sk = skel.copy().astype(np.uint8)
+    H, W = sk.shape
+    changed = True
+    while changed:
+        changed = False
+        ys, xs = np.where(sk == 1)
+        for y0, x0 in zip(ys, xs):
+            if sk[y0, x0] == 0:
+                continue
+            # endpoint?
+            deg0 = 0
+            for ny, nx in _neighbors8(y0, x0, H, W):
+                if sk[ny, nx] == 1:
+                    deg0 += 1
+            if deg0 != 1:
+                continue
+            # walk forward until junction/end or exceed max_len
+            py, px = -1, -1
+            y, x = y0, x0
+            trail = []
+            steps = 0
+            while steps <= max_len:
+                trail.append((y, x))
+                steps += 1
+                nbrs = [(ny, nx) for ny, nx in _neighbors8(y, x, H, W) if sk[ny, nx] == 1 and (ny, nx) != (py, px)]
+                if len(nbrs) == 0:
+                    # dead end -> remove trail
+                    for yy, xx in trail:
+                        sk[yy, xx] = 0
+                    changed = True
+                    break
+                if len(nbrs) >= 2:
+                    # hit junction: remove if short
+                    if steps - 1 <= max_len:
+                        for yy, xx in trail:
+                            sk[yy, xx] = 0
+                        changed = True
+                    break
+                # len(nbrs) == 1: continue walking
+                py, px = y, x
+                y, x = nbrs[0]
+    return sk
+
+def _junction_nms(skel: np.ndarray, prob: np.ndarray) -> np.ndarray:
+    """Only suppress non-maxima at junctions (deg ≥ 3) in 3x3 windows."""
+    H, W = skel.shape
+    deg = _degree_map(skel)
+    keep = skel.copy().astype(np.uint8)
+    ys, xs = np.where((skel == 1) & (deg >= 3))
+    for y, x in zip(ys, xs):
+        p0 = prob[y, x]
+        # if any skeleton neighbor in 3x3 has strictly higher prob, drop center
+        if np.any((skel[max(0,y-1):min(H,y+2), max(0,x-1):min(W,x+2)] == 1) &
+                  (prob[max(0,y-1):min(H,y+2), max(0,x-1):min(W,x+2)] > p0)):
+            keep[y, x] = 0
+    return keep
+
 
 def _track_len_rows(t: Track) -> int:
     if not t.points:
@@ -381,18 +459,59 @@ def run_kymobutler(
     # component filter prior to skeletonization
     mask_f = filter_components(mask, min_px=comp_min_px, min_rows=comp_min_rows)
 
-    # thinning (skimage.thin preserves obliques better than some alternatives)
-    skel = _thin(mask_f.astype(bool)).astype(np.uint8)
+    # --- skeletonization: THIN to preserve obliques
+    skel_base = _thin(mask_f.astype(bool)).astype(np.uint8)
 
-    # optional: close tiny breaks on skeleton then re-thin
-    skel_closed = cv2.morphologyEx(
-        skel, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    )
-    skel = _thin(skel_closed.astype(bool)).astype(np.uint8)
+    # Adaptive cleaning guardrails
+    BASE_PX = int(skel_base.sum())
+    MIN_KEEP_RATIO = 0.60     # never drop below 60% of base skeleton pixels
+    MIN_KEEP_PX    = max(2000, int(MIN_KEEP_RATIO * BASE_PX))  # absolute floor, protects sparse images
 
-    # prune endpoints lightly
+    # 1) Probability floor on corridors only (do NOT trim junctions)
+    skel = skel_base.copy()
+    deg  = _degree_map(skel)
+    corridor = (skel == 1) & (deg <= 2)
+
+    if np.any(skel):
+        vals = prob[skel == 1]
+        # dynamic floor: 10th percentile, clipped to [0.06, 0.10]
+        p10 = float(np.percentile(vals, 10.0)) if vals.size else 0.08
+        PROB_FLOOR = min(0.10, max(0.06, p10))
+    else:
+        PROB_FLOOR = 0.08
+
+    to_drop = corridor & (prob < PROB_FLOOR)
+    skel[to_drop] = 0
+    skel = _thin(skel.astype(bool)).astype(np.uint8)
+
+    # Guardrail: if we removed too much, back off the floor
+    if int(skel.sum()) < MIN_KEEP_PX:
+        skel = skel_base.copy()
+
+    # 2) Junction-only NMS (reduce hair only where necessary)
+    skel_nms = _junction_nms(skel, prob)
+    skel_nms = _thin(skel_nms.astype(bool)).astype(np.uint8)
+
+    # Guardrail: if this step nukes too much, skip it
+    if int(skel_nms.sum()) >= MIN_KEEP_PX:
+        skel = skel_nms
+    # else keep 'skel' from previous step
+
+    # 3) Spur pruning with backoff if too destructive
+    for spur_len in [5, 4, 3]:
+        skel_try = _spur_prune_by_len(skel, max_len=spur_len)
+        if int(skel_try.sum()) >= MIN_KEEP_PX:
+            skel = skel_try
+            break  # accepted
+    # optional small endpoint prune (your existing knob)
     if prune_iters > 0:
         skel = prune_endpoints(skel, iterations=prune_iters)
+
+    if verbose:
+        print("[debug.skel] base_px:", BASE_PX,
+            " after_floor:", int((_thin((skel_base & corridor & (prob >= PROB_FLOOR)).astype(bool)).sum())) if BASE_PX else 0,
+            " final_px:", int(skel.sum()),
+            " keep_floor:", MIN_KEEP_PX)
 
     if verbose:
         dbg = base_dir / "debug"
