@@ -12,9 +12,22 @@ from .kymobutler_pt import KymoButlerPT
 
 Coord = Tuple[int, int]  # (y, x)
 
+# 8-connected neighborhood
 _OFFSETS_8 = [(-1,-1), (-1,0), (-1,1),
               ( 0,-1),         ( 0,1),
               ( 1,-1), ( 1,0), ( 1,1)]
+
+# Direction <-> index maps for per-edge visitation
+_DIR_TO_IDX = {d:i for i,d in enumerate(_OFFSETS_8)}
+_IDX_TO_DIR = {i:d for d,i in _DIR_TO_IDX.items()}
+
+def _dir_idx(dy: int, dx: int) -> int:
+    return _DIR_TO_IDX[(dy, dx)]
+
+def _opp_dir_idx(idx: int) -> int:
+    dy, dx = _IDX_TO_DIR[idx]
+    oy, ox = -dy, -dx
+    return _DIR_TO_IDX[(oy, ox)]
 
 def neighbors8(y: int, x: int, H: int, W: int) -> Iterable[Coord]:
     for dy, dx in _OFFSETS_8:
@@ -98,7 +111,8 @@ class CrossingTracker:
                  seed_interior: bool = True,
                  max_iters: int = 50):
         """
-        Crossing-aware tracker. Iteratively harvests tracks from the skeleton until leftovers dry up.
+        Crossing-aware tracker with edge-level visitation.
+        Iteratively harvests tracks from the skeleton until leftovers dry up.
         """
         self.kb = kb
         self.ch, self.cw = decision_crop_hw
@@ -108,7 +122,28 @@ class CrossingTracker:
         self.decision_thr = decision_thr
         self.seed_interior = seed_interior
         self.max_iters = max_iters
+        self._raw01_cache: Optional[np.ndarray] = None  # set per extract() call
 
+    # -------- edge-visited helpers --------
+    @staticmethod
+    def _edge_is_used(visited_edge: np.ndarray, y: int, x: int, ny: int, nx: int) -> bool:
+        dy, dx = ny - y, nx - x
+        if (dy, dx) not in _DIR_TO_IDX:
+            return True
+        idx = _dir_idx(dy, dx)
+        return visited_edge[y, x, idx] == 1
+
+    @staticmethod
+    def _mark_edge(visited_edge: np.ndarray, y: int, x: int, ny: int, nx: int):
+        dy, dx = ny - y, nx - x
+        if (dy, dx) not in _DIR_TO_IDX:
+            return
+        i1 = _dir_idx(dy, dx)
+        i2 = _opp_dir_idx(i1)
+        visited_edge[y, x, i1] = 1
+        visited_edge[ny, nx, i2] = 1
+
+    # -------- decision scoring --------
     def _score_branches(self, raw01: np.ndarray, skel_all: np.ndarray,
                         curr_pts: List[Coord], junction: Coord,
                         cand_starts: List[Coord]) -> Optional[Coord]:
@@ -157,68 +192,103 @@ class CrossingTracker:
             y, x = nbrs[0]
         return path
 
+    # -------- edge-aware walking & growing --------
+    def _walk_one_dir(self, start: Coord, prev: Coord,
+                      skel: np.ndarray,
+                      visited_px: np.ndarray,
+                      visited_edge: np.ndarray) -> List[Coord]:
+        """
+        Walk in one direction, marking edges as used at junctions, and pixels in corridors.
+        Uses decision-map scoring at junctions.
+        """
+        assert self._raw01_cache is not None, "raw01 cache must be set before walking"
+        raw01 = self._raw01_cache
+
+        H, W = skel.shape
+        y, x = start
+        prev_y, prev_x = prev
+        acc: List[Coord] = []
+
+        while True:
+            if skel[y, x] == 0:
+                break
+
+            deg = degree_at(skel, y, x)
+
+            # Corridor pixels can be pixel-visited; junctions keep pixel free (edge-wise control)
+            if deg <= 2:
+                if visited_px[y, x] == 1:
+                    break
+                visited_px[y, x] = 1
+
+            acc.append((y, x))
+
+            # Candidate neighbors (excluding immediate back-step)
+            nbrs = [(ny, nx) for ny, nx in neighbors8(y, x, H, W)
+                    if skel[ny, nx] == 1 and (ny, nx) != (prev_y, prev_x)]
+
+            # Prefer neighbors via UNUSED edges
+            nbrs = [(ny, nx) for (ny, nx) in nbrs if not self._edge_is_used(visited_edge, y, x, ny, nx)]
+
+            if not nbrs:
+                break
+
+            if deg == 1:
+                ny, nx = nbrs[0]
+            elif deg == 2:
+                ny, nx = nbrs[0]
+            else:
+                chosen = self._score_branches(raw01, skel, acc, (y, x), nbrs)
+                if chosen is None:
+                    # fallback: straightness toward previous direction
+                    vy, vx = y - prev_y, x - prev_x
+                    def straightness(n):
+                        dy, dx = n[0] - y, n[1] - x
+                        return -(vy*dy + vx*dx)
+                    ny, nx = min(nbrs, key=straightness)
+                else:
+                    ny, nx = chosen
+
+            # Mark the edge we will traverse (both directions)
+            self._mark_edge(visited_edge, y, x, ny, nx)
+
+            prev_y, prev_x = y, x
+            y, x = ny, nx
+
+        return acc
+
     def _grow_from(self, raw01: np.ndarray, skel: np.ndarray, seed: Coord,
-                   visited: np.ndarray, bidir: bool) -> List[Coord]:
+                   visited_px: np.ndarray, visited_edge: np.ndarray, bidir: bool) -> List[Coord]:
         """Grow a track from 'seed'. If bidir=True, grow forward and backward from the seed."""
         H, W = skel.shape
         y0, x0 = seed
-        if skel[y0, x0] == 0 or visited[y0, x0] == 1:
+        if skel[y0, x0] == 0:
             return []
 
-        def _walk_one_dir(start: Coord, prev: Coord) -> List[Coord]:
-            y, x = start
-            prev_y, prev_x = prev
-            acc: List[Coord] = []
-            while True:
-                if skel[y, x] == 0 or visited[y, x] == 1:
-                    break
-                acc.append((y, x))
-                visited[y, x] = 1
-                deg = degree_at(skel, y, x)
-                nbrs = [(ny, nx) for ny, nx in neighbors8(y, x, H, W)
-                        if skel[ny, nx] == 1 and (ny, nx) != (prev_y, prev_x) and visited[ny, nx] == 0]
-                if deg == 1:
-                    break
-                elif deg == 2:
-                    if not nbrs:
-                        break
-                    prev_y, prev_x = y, x
-                    y, x = nbrs[0]
-                    continue
-                else:
-                    # Junction: choose path via decision net, fallback to straightest
-                    cand = nbrs
-                    if not cand:
-                        break
-                    chosen = self._score_branches(raw01, skel, acc, (y, x), cand)
-                    if chosen is None:
-                        vy, vx = y - prev_y, x - prev_x
-                        def straightness(n):
-                            dy, dx = n[0] - y, n[1] - x
-                            return -(vy*dy + vx*dx)
-                        chosen = min(cand, key=straightness)
-                    prev_y, prev_x = y, x
-                    y, x = chosen
-            return acc
+        # neighbors from seed that have UNUSED edges
+        nbrs0 = [(ny, nx) for ny, nx in neighbors8(y0, x0, H, W)
+                 if skel[ny, nx] == 1 and not self._edge_is_used(visited_edge, y0, x0, ny, nx)]
 
-        # neighbors of the seed
-        nbrs0 = [(ny, nx) for ny, nx in neighbors8(y0, x0, H, W) if skel[ny, nx] == 1]
         if not nbrs0:
-            visited[y0, x0] = 1
-            return [(y0, x0)]
+            # allow single-pixel capture if corridor & not visited
+            if degree_at(skel, y0, x0) <= 2 and visited_px[y0, x0] == 0:
+                visited_px[y0, x0] = 1
+                return [(y0, x0)]
+            return []
 
-        if bidir and len(nbrs0) >= 1:
-            forward_start = nbrs0[0]
-            backward_start = nbrs0[1] if len(nbrs0) >= 2 else None
-            fwd = _walk_one_dir(forward_start, prev=(y0, x0))
-            bwd = _walk_one_dir(backward_start, prev=(y0, x0)) if backward_start is not None else []
-            if visited[y0, x0] == 0:
-                visited[y0, x0] = 1
-            track = list(reversed(bwd)) + [(y0, x0)] + fwd
+        if bidir:
+            fwd_start = nbrs0[0]
+            bwd_start = nbrs0[1] if len(nbrs0) >= 2 else None
+            fwd = self._walk_one_dir(fwd_start, prev=(y0, x0), skel=skel,
+                                     visited_px=visited_px, visited_edge=visited_edge)
+            bwd = self._walk_one_dir(bwd_start, prev=(y0, x0), skel=skel,
+                                     visited_px=visited_px, visited_edge=visited_edge) if bwd_start else []
+            pts = list(reversed(bwd)) + [(y0, x0)] + fwd
         else:
-            track = [(y0, x0)] + _walk_one_dir(nbrs0[0], prev=(y0, x0))
+            pts = [(y0, x0)] + self._walk_one_dir(nbrs0[0], prev=(y0, x0), skel=skel,
+                                                  visited_px=visited_px, visited_edge=visited_edge)
 
-        return enforce_one_point_per_row(track)
+        return enforce_one_point_per_row(pts)
 
     @staticmethod
     def _subtract_tracks(src: np.ndarray, trks: List[Track]) -> np.ndarray:
@@ -232,6 +302,7 @@ class CrossingTracker:
                 m[ys, xs] = 1
         return (src & (~m)).astype(np.uint8)
 
+    # -------- main extraction loop --------
     def extract_tracks(self, raw_gray: np.ndarray, skel: np.ndarray) -> List[Track]:
         """
         Iteratively extract tracks:
@@ -239,9 +310,8 @@ class CrossingTracker:
           2) Interior seeding pass (bidirectional).
           3) Subtract explained pixels, repeat until dry or max_iters.
         """
-        raw01 = raw_gray.astype(np.float32)
-        if raw01.max() > 1.0:
-            raw01 /= 255.0
+        raw01 = _norm01(raw_gray)
+        self._raw01_cache = raw01
 
         remaining = skel.copy().astype(np.uint8)
         tracks: List[Track] = []
@@ -252,39 +322,50 @@ class CrossingTracker:
             it += 1
             new_tracks: List[Track] = []
 
-            # fresh visitation mask for this iteration over 'remaining'
-            visited = np.zeros_like(remaining, dtype=np.uint8)
+            # (re)initialize visitation for this pass
+            visited_px = np.zeros_like(remaining, dtype=np.uint8)
+            visited_edge = np.zeros((*remaining.shape, 8), dtype=np.uint8)
 
-            # Pass 1: endpoints
+            # Pass 1: endpoints first (more stable)
             endpoints, _ = find_endpoints_and_junctions(remaining)
             for seed in endpoints:
-                if remaining[seed] == 0 or visited[seed] == 1:
+                y, x = seed
+                if remaining[y, x] == 0:
                     continue
-                trk = self._grow_from(raw01, remaining, seed, visited, bidir=False)
+                trk = self._grow_from(raw01, remaining, seed, visited_px, visited_edge, bidir=False)
                 if len(trk) >= self.min_track_len:
                     new_tracks.append(Track(points=trk, id=tid)); tid += 1
 
-            # Pass 2: interior seeds (if enabled)
+            # Pass 2: interior seeding — any pixel that still has an UNUSED edge
             if self.seed_interior:
-                ys, xs = np.where((remaining == 1) & (visited == 0))
+                H, W = remaining.shape
+                ys, xs = np.where(remaining == 1)
                 for y, x in zip(ys, xs):
-                    if visited[y, x] == 1 or remaining[y, x] == 0:
+                    # quick check: does (y,x) have any unused outgoing edge?
+                    has_free = False
+                    for ny, nx in neighbors8(y, x, H, W):
+                        if remaining[ny, nx] == 1 and not self._edge_is_used(visited_edge, y, x, ny, nx):
+                            has_free = True
+                            break
+                    if not has_free:
                         continue
-                    trk = self._grow_from(raw01, remaining, (y, x), visited, bidir=True)
+                    trk = self._grow_from(raw01, remaining, (y, x), visited_px, visited_edge, bidir=True)
                     if len(trk) >= self.min_track_len:
                         new_tracks.append(Track(points=trk, id=tid)); tid += 1
 
             if not new_tracks:
-                break  # nothing left to explain
+                break  # nothing else to harvest
 
             # Accumulate and subtract for next iteration
             tracks.extend(new_tracks)
             remaining = self._subtract_tracks(remaining, new_tracks)
 
-            # Early exit if almost nothing left
+            # done if nothing left
             if int(remaining.sum()) <= 0:
                 break
 
+        # clear cache
+        self._raw01_cache = None
         return tracks
 
     @staticmethod

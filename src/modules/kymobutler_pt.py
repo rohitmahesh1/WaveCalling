@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import onnx
 import onnxruntime as ort
+import math
 
 from skimage.morphology import skeletonize as _skel, thin
 from skimage.measure import label, regionprops
@@ -168,6 +169,25 @@ def _preproc_like_wl(img_gray: np.ndarray) -> np.ndarray:
     x = _normlines_like_wl(x)
     return x
 
+def _round_up(v, base):
+    return int(base * math.ceil(float(v) / base))
+
+def _hann1d(n: int) -> np.ndarray:
+    # Hann with floor to avoid 0-weight borders (prevents divide-by-zero at edges)
+    if n <= 1:
+        return np.ones((n,), dtype=np.float32)
+    w = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n, dtype=np.float32) / (n - 1))
+    return np.maximum(w.astype(np.float32), 0.25)  # clamp to 0.25 at edges
+
+def _hann2d(h: int, w: int) -> np.ndarray:
+    return np.outer(_hann1d(h), _hann1d(w)).astype(np.float32)
+
+def _ensure_min_hw(img01: np.ndarray, min_h: int, min_w: int) -> np.ndarray:
+    h, w = img01.shape[:2]
+    if h >= min_h and w >= min_w:
+        return img01
+    return cv2.resize(img01, (max(min_w, w), max(min_h, h)), interpolation=cv2.INTER_CUBIC)
+
 class ORTModel:
     def __init__(self, path: str):
         self.path = str(path)
@@ -240,7 +260,10 @@ class ORTModel:
 
 class KymoButlerPT:
     """ORT-based runner for KymoButler ONNX models, with WL-like preprocessing."""
-    def __init__(self, export_dir=None, seg_size=256):
+    def __init__(self, export_dir=None, seg_size=256,
+                 tile_stride: int = 128,    # overlap = seg_size - stride
+                 tile_round_to: int = 16,   # round full-res canvas to multiple of this
+                 use_tiling: bool = True):
         export_dir = _find_export_dir(export_dir)
         paths = {
             k: export_dir / f
@@ -258,16 +281,29 @@ class KymoButlerPT:
         self.bi = ORTModel(paths["bi"])
         self.clf = ORTModel(paths["clf"])
         self.dec = ORTModel(paths["dec"])
-        self.uni_hw = (seg_size, seg_size)
-        self.bi_hw = (seg_size, seg_size)
+
+        # ONNX input tile size (fixed by export)
+        self.seg_hw = (int(seg_size), int(seg_size))
+        self.uni_hw = self.seg_hw
+        self.bi_hw  = self.seg_hw
         self.clf_hw = (64, 64)
         self.dec_hw = (48, 48)
 
-    # --- public helper to give tracker the exact preprocessed, seg-sized gray ---
-    def preproc_for_seg(self, img_gray: np.ndarray) -> np.ndarray:
-        """Return WL-like preprocessed grayscale resized to (seg_size, seg_size)."""
+        # tiling controls
+        self.tile_stride   = int(tile_stride)
+        self.tile_round_to = int(tile_round_to)
+        self.use_tiling    = bool(use_tiling)
+
+    # --- public helper so tracker can get preprocessed gray at arbitrary hw ---
+    def preproc_for_seg(self, img_gray: np.ndarray, hw: tuple[int, int] | None = None) -> np.ndarray:
+        """
+        Return WL-like preprocessed grayscale resized to 'hw' if provided;
+        otherwise returns (seg_size, seg_size).
+        """
         x = _preproc_like_wl(img_gray)
-        return _resize_hw(x, self.uni_hw)
+        if hw is None:
+            hw = self.seg_hw
+        return _resize_hw(x, hw)
 
     # --- internal prep to NCHW float32 ---
     def _prep_gray(self, img: np.ndarray, hw: tuple[int, int], *, wl_preproc: bool) -> np.ndarray:
@@ -275,9 +311,88 @@ class KymoButlerPT:
         img01 = _resize_hw(img01, hw)
         return img01[None, None, ...].astype(np.float32)  # NCHW
 
-    # --- classifier ---
+    # ========== TILED INFERENCE CORE ==========
+    def _tile_infer_2d(self, img01: np.ndarray, run_fn, *, out_kind: str):
+        """
+        Slide a (seg_h, seg_w) window with stride across img01 (H',W').
+        'run_fn(tile_nchw)->dict' should return ORT outputs for that tile.
+        out_kind: 'bi' -> single map; 'uni' -> two maps ('ant','ret' or 2ch)
+        Returns:
+          if 'bi' : prob (H',W')
+          if 'uni': dict {'ant': (H',W'), 'ret': (H',W')}
+        """
+        seg_h, seg_w = self.seg_hw
+        H, W = img01.shape
+        # Ensure canvas >= tile size
+        img01 = _ensure_min_hw(img01, seg_h, seg_w)
+        H, W = img01.shape
+
+        # Round canvas up to multiple of tile_round_to to stabilize coverage
+        Hr = _round_up(H, self.tile_round_to)
+        Wr = _round_up(W, self.tile_round_to)
+        if (Hr, Wr) != (H, W):
+            img01 = cv2.resize(img01, (Wr, Hr), interpolation=cv2.INTER_AREA)
+            H, W = Hr, Wr
+
+        stride = self.tile_stride
+        wy = list(range(0, max(1, H - seg_h + 1), stride))
+        wx = list(range(0, max(1, W - seg_w + 1), stride))
+        if wy[-1] != H - seg_h: wy.append(H - seg_h)
+        if wx[-1] != W - seg_w: wx.append(W - seg_w)
+
+        w2d = _hann2d(seg_h, seg_w)  # soft blend; floored to 0.25 inside _hann1d
+        eps = 1e-6
+
+        if out_kind == "bi":
+            acc = np.zeros((H, W), dtype=np.float32)
+            wsum = np.zeros((H, W), dtype=np.float32)
+        else:
+            acc_ant = np.zeros((H, W), dtype=np.float32)
+            acc_ret = np.zeros((H, W), dtype=np.float32)
+            wsum    = np.zeros((H, W), dtype=np.float32)
+
+        for y in wy:
+            for x in wx:
+                tile = img01[y:y+seg_h, x:x+seg_w]
+                tile_nchw = tile[None, None, ...].astype(np.float32)
+                out = run_fn(tile_nchw)
+
+                if out_kind == "bi":
+                    ypred = list(out.values())[0]  # [1,1,h,w] or [1,h,w] or [1,h,w,1]
+                    ypred = np.squeeze(ypred)
+                    prob = _as_prob(ypred).astype(np.float32)
+                    acc[y:y+seg_h, x:x+seg_w] += prob * w2d
+                    wsum[y:y+seg_h, x:x+seg_w] += w2d
+                else:
+                    if "ant" in out and "ret" in out:
+                        ant = _as_prob(out["ant"]).squeeze().astype(np.float32)
+                        ret = _as_prob(out["ret"]).squeeze().astype(np.float32)
+                    else:
+                        ypred = list(out.values())[0]
+                        ypred = np.squeeze(ypred)  # [2,h,w] or [h,w,2]
+                        if ypred.ndim == 3 and ypred.shape[0] == 2:
+                            ant = _as_prob(ypred[0]).astype(np.float32)
+                            ret = _as_prob(ypred[1]).astype(np.float32)
+                        elif ypred.ndim == 3 and ypred.shape[-1] == 2:
+                            ant = _as_prob(ypred[..., 0]).astype(np.float32)
+                            ret = _as_prob(ypred[..., 1]).astype(np.float32)
+                        else:
+                            raise RuntimeError(f"Unexpected uni_seg tile out shape: {ypred.shape}")
+                    acc_ant[y:y+seg_h, x:x+seg_w] += ant * w2d
+                    acc_ret[y:y+seg_h, x:x+seg_w] += ret * w2d
+                    wsum[y:y+seg_h, x:x+seg_w]    += w2d
+
+        if out_kind == "bi":
+            prob_full = acc / np.maximum(wsum, eps)
+            return prob_full[:H, :W].astype(np.float32)
+        else:
+            ant_full = acc_ant / np.maximum(wsum, eps)
+            ret_full = acc_ret / np.maximum(wsum, eps)
+            return {"ant": ant_full[:H, :W].astype(np.float32),
+                    "ret": ret_full[:H, :W].astype(np.float32)}
+
+    # ========== CLASSIFIER / DECISION (unchanged) ==========
     def classify(self, img_gray: np.ndarray) -> dict:
-        # WL segments always after preproc; apply same for classifier
         x = self._prep_gray(img_gray, self.clf_hw, wl_preproc=True)
         out = self.clf.run(x)
         y = list(out.values())[0]  # expected [1,2]
@@ -286,8 +401,93 @@ class KymoButlerPT:
         label = int(np.argmax(probs))
         return {"logits": logits, "probs": probs, "label": label}
 
-    # --- unidirectional segmentation: {"ant": HxW, "ret": HxW} probs ---
+    def decision_map(self, crop_raw01: np.ndarray, crop_skel_all: np.ndarray, crop_skel_curr: np.ndarray) -> np.ndarray:
+        x = np.stack([
+            _resize_hw(_to_01_gray(crop_raw01), self.dec_hw),
+            _resize_hw(_to_01_gray(crop_skel_all), self.dec_hw),
+            _resize_hw(_to_01_gray(crop_skel_curr), self.dec_hw),
+        ], axis=0)[None, ...].astype(np.float32)
+        out = self.dec.run(x)
+        y = list(out.values())[0]  # [1,48,48,2] or [1,2,48,48]
+        if y.ndim == 4 and y.shape[-1] == 2:
+            prob = _softmax(y, axis=-1)[0, ..., 1]
+        elif y.ndim == 4 and y.shape[1] == 2:
+            prob = _softmax(np.moveaxis(y, 1, -1), axis=-1)[0, ..., 1]
+        else:
+            raise RuntimeError(f"Unexpected decision output shape: {y.shape}")
+        return prob.astype(np.float32)
+
+    # ========== FULL-RES SEGMENTATION (Phase A) ==========
+    def segment_bi_full(self, img_gray: np.ndarray) -> np.ndarray:
+        """
+        Full-resolution bidirectional segmentation with tiling/blending.
+        Returns prob map with size ≈ original (rounded to tile_round_to).
+        """
+        img01 = _preproc_like_wl(img_gray)
+        # (Optionally) allow disabling tiling for 256×256 behavior
+        if not self.use_tiling:
+            x = self._prep_gray(img_gray, self.bi_hw, wl_preproc=True)
+            out = self.bi.run(x)
+            y = list(out.values())[0]
+            y = np.squeeze(y)
+            return _as_prob(y).astype(np.float32)
+
+        # Prepare a canvas ~native resolution
+        H0, W0 = img01.shape
+        # Ensure minimum = tile size; round to multiple for stable coverage
+        Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
+        Wt = max(self.seg_hw[1], _round_up(W0, self.tile_round_to))
+        img01r = cv2.resize(img01, (Wt, Ht), interpolation=cv2.INTER_AREA)
+
+        def _run(tile_nchw):
+            return self.bi.run(tile_nchw)
+
+        prob = self._tile_infer_2d(img01r, _run, out_kind="bi")
+        return prob  # (Ht, Wt)
+
+    def segment_uni_full(self, img_gray: np.ndarray) -> dict:
+        """
+        Full-resolution unidirectional segmentation with tiling/blending.
+        Returns dict {'ant': HxW, 'ret': HxW}.
+        """
+        img01 = _preproc_like_wl(img_gray)
+        if not self.use_tiling:
+            x = self._prep_gray(img_gray, self.uni_hw, wl_preproc=True)
+            out = self.uni.run(x)
+            if "ant" in out and "ret" in out:
+                return {"ant": _as_prob(out["ant"]).squeeze().astype(np.float32),
+                        "ret": _as_prob(out["ret"]).squeeze().astype(np.float32)}
+            y = list(out.values())[0]
+            if y.ndim == 4 and y.shape[1] == 2:
+                return {"ant": _as_prob(y[:, 0]).squeeze().astype(np.float32),
+                        "ret": _as_prob(y[:, 1]).squeeze().astype(np.float32)}
+            elif y.ndim == 4 and y.shape[-1] == 2:
+                return {"ant": _as_prob(y[..., 0]).squeeze().astype(np.float32),
+                        "ret": _as_prob(y[..., 1]).squeeze().astype(np.float32)}
+            raise RuntimeError(f"Unexpected uni_seg output shape: {y.shape}")
+
+        H0, W0 = img01.shape
+        Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
+        Wt = max(self.seg_hw[1], _round_up(W0, self.tile_round_to))
+        img01r = cv2.resize(img01, (Wt, Ht), interpolation=cv2.INTER_AREA)
+
+        def _run(tile_nchw):
+            return self.uni.run(tile_nchw)
+
+        out_full = self._tile_infer_2d(img01r, _run, out_kind="uni")
+        return out_full  # {'ant':(Ht,Wt), 'ret':(Ht,Wt)}
+
+    # ========== LEGACY (kept for compatibility) ==========
+    def segment_bi(self, img_gray: np.ndarray) -> np.ndarray:
+        """Legacy: 256×256 output for existing code paths."""
+        x = self._prep_gray(img_gray, self.bi_hw, wl_preproc=True)
+        out = self.bi.run(x)
+        y = list(out.values())[0]  # [1,1,H,W] or [1,H,W] or [1,H,W,1]
+        y = y.squeeze()
+        return _as_prob(y)
+
     def segment_uni(self, img_gray: np.ndarray) -> dict:
+        """Legacy: 256×256 output for existing code paths."""
         x = self._prep_gray(img_gray, self.uni_hw, wl_preproc=True)
         out = self.uni.run(x)
         if "ant" in out and "ret" in out:
@@ -304,28 +504,3 @@ class KymoButlerPT:
             else:
                 raise RuntimeError(f"Unexpected uni_seg output shape: {y.shape}")
         return {"ant": ant, "ret": ret}
-
-    # --- bidirectional segmentation: HxW prob map ---
-    def segment_bi(self, img_gray: np.ndarray) -> np.ndarray:
-        x = self._prep_gray(img_gray, self.bi_hw, wl_preproc=True)
-        out = self.bi.run(x)
-        y = list(out.values())[0]  # [1,1,H,W] or [1,H,W] or [1,H,W,1]
-        y = y.squeeze()
-        return _as_prob(y)
-
-    # --- decision map on 48x48 crop: HxW prob of foreground (class 1) ---
-    def decision_map(self, crop_raw01: np.ndarray, crop_skel_all: np.ndarray, crop_skel_curr: np.ndarray) -> np.ndarray:
-        x = np.stack([
-            _resize_hw(_to_01_gray(crop_raw01), self.dec_hw),
-            _resize_hw(_to_01_gray(crop_skel_all), self.dec_hw),
-            _resize_hw(_to_01_gray(crop_skel_curr), self.dec_hw),
-        ], axis=0)[None, ...].astype(np.float32)
-        out = self.dec.run(x)
-        y = list(out.values())[0]  # [1,48,48,2] or [1,2,48,48]
-        if y.ndim == 4 and y.shape[-1] == 2:  # NHWC
-            prob = _softmax(y, axis=-1)[0, ..., 1]
-        elif y.ndim == 4 and y.shape[1] == 2:  # NCHW
-            prob = _softmax(np.moveaxis(y, 1, -1), axis=-1)[0, ..., 1]
-        else:
-            raise RuntimeError(f"Unexpected decision output shape: {y.shape}")
-        return prob.astype(np.float32)
