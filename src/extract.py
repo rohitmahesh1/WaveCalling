@@ -179,12 +179,7 @@ def _cfg_get(dct, path, default=None):
 
 
 def _build_kymo_runner(cfg, log, verbose):
-    """
-    Returns (run_kymo_callable, kwargs_dict, backend_name_str)
-    based on cfg['kymo'].
-    """
     kymo_cfg = cfg.get('kymo', {}) or {}
-
     backend = str(kymo_cfg.get('backend', 'onnx')).lower()
     if backend not in ('onnx', 'wolfram'):
         log.warning(f"Unknown kymo.backend={backend!r}; defaulting to 'onnx'")
@@ -192,26 +187,17 @@ def _build_kymo_runner(cfg, log, verbose):
 
     if backend == 'wolfram':
         from .modules.kymo_interface import run_kymobutler as _runner
-        min_len = (
-            _cfg_get(kymo_cfg, ['onx', 'tracking', 'min_length']) or
-            kymo_cfg.get('min_length') or
-            30
-        )
-        kwargs = dict(
-            min_length=int(min_len),
-            verbose=bool(verbose),
-        )
+        min_len = kymo_cfg.get('min_length', 30)
+        kwargs = dict(min_length=int(min_len), verbose=bool(verbose))
         return _runner, kwargs, 'wolfram'
 
-    # ONNX backend
+    # ---- ONNX backend ----
     from .modules.kb_adapter import run_kymobutler as _runner
-
     onnx_cfg = kymo_cfg.get('onnx', {}) or {}
 
     export_dir   = onnx_cfg.get('export_dir', None)
     seg_size     = int(onnx_cfg.get('seg_size', 256))
     force_mode   = onnx_cfg.get('force_mode', None)
-
     fuse_uni_into_bi = bool(onnx_cfg.get('fuse_uni_into_bi', True))
     fuse_uni_weight  = float(onnx_cfg.get('fuse_uni_weight', 0.7))
 
@@ -235,35 +221,71 @@ def _build_kymo_runner(cfg, log, verbose):
     morph_mode = str(morph.get('mode', 'directional'))
     morph_close_open_close = (morph_mode == 'classic')
     directional_close      = (morph_mode == 'directional')
-    dir_kv = int(_cfg_get(morph, ['directional', 'kv'], 5))
-    dir_kh = int(_cfg_get(morph, ['directional', 'kh'], 5))
-    diag_bridge = bool(_cfg_get(morph, ['directional', 'diag_bridge'], True))
+    dir_kv = int((morph.get('directional', {}) or {}).get('kv', 5))
+    dir_kh = int((morph.get('directional', {}) or {}).get('kh', 5))
+    diag_bridge = bool((morph.get('directional', {}) or {}).get('diag_bridge', True))
 
     comp = onnx_cfg.get('components', {}) or {}
     comp_min_px   = int(comp.get('min_px', 5))
     comp_min_rows = int(comp.get('min_rows', 5))
 
+    # --- NEW: skeleton guardrails & clamps ---
     skel = onnx_cfg.get('skeleton', {}) or {}
+    keep_ratio = float(skel.get('keep_ratio', 0.60))
+    keep_min_px = int(skel.get('keep_min_px', 2000))
+    skel_prob_floor_min = float(skel.get('prob_floor_min', 0.06))
+    skel_prob_floor_max = float(skel.get('prob_floor_max', 0.10))
     prune_iters = int(skel.get('prune_iters', 0))
+
+    # postproc → adapter arg names
+    post = onnx_cfg.get('postproc', {}) or {}
+    extend_rows = int(post.get('extend_rows', 22))
+    dx_win = int(post.get('dx_win', 4))
+    refine_prob_min = float(post.get('prob_min', 0.11))        # map YAML prob_min → adapter refine_prob_min
+    max_gap_rows = int(post.get('max_gap_rows', 13))
+    max_dx = int(post.get('max_dx', 6))
+    prob_bridge_min = float(post.get('prob_bridge_min', 0.11))
+    dedupe = post.get('dedupe', {}) or {}
+    dedupe_enable = bool(dedupe.get('enabled', True))
+    dedupe_min_rows = int(dedupe.get('min_rows', 30))
+    dedupe_min_score = float(dedupe.get('min_score', 0.11))
+    dedupe_overlap_iou = float(dedupe.get('overlap_iou', 0.80))
+    dedupe_dx_tol = float(dedupe.get('dx_tol', 2.5))
+
+    # --- NEW: debug toggle for image dumps ---
+    dbg = onnx_cfg.get('debug', {}) or {}
+    debug_save_images = bool(dbg.get('save_debug_images', True))
 
     track = onnx_cfg.get('tracking', {}) or {}
     min_length = int(track.get('min_length', 30))
 
     kwargs = dict(
+        # core
         min_length=min_length,
         verbose=bool(verbose),
         export_dir=export_dir,
         seg_size=seg_size,
         thr=thr,
-        min_component_px=comp_min_px,
+
+        # per-mode thresholds & mode
         force_mode=force_mode,
         thr_uni=thr_uni,
         thr_bi=thr_bi,
+
+        # morphology & components
         morph_close_open_close=morph_close_open_close,
         directional_close=directional_close,
         comp_min_px=comp_min_px,
         comp_min_rows=comp_min_rows,
+
+        # skeleton guardrails & clamps (NEW)
+        skel_keep_ratio=keep_ratio,
+        skel_keep_min_px=keep_min_px,
+        skel_prob_floor_min=skel_prob_floor_min,
+        skel_prob_floor_max=skel_prob_floor_max,
         prune_iters=prune_iters,
+
+        # auto-threshold & hysteresis
         auto_threshold=auto_threshold,
         auto_sweep=auto_sweep,
         auto_target_pct=auto_target_pct,
@@ -271,11 +293,33 @@ def _build_kymo_runner(cfg, log, verbose):
         hysteresis_enable=hysteresis_enable,
         hysteresis_low=hysteresis_low,
         hysteresis_high=hysteresis_high,
-        fuse_uni_into_bi=fuse_uni_into_bi,
-        fuse_uni_weight=fuse_uni_weight,
+
+        # directional kernels & bridging
         dir_kv=dir_kv,
         dir_kh=dir_kh,
         diag_bridge=diag_bridge,
+
+        # fusion
+        fuse_uni_into_bi=fuse_uni_into_bi,
+        fuse_uni_weight=fuse_uni_weight,
+
+        # refine/merge
+        extend_rows=extend_rows,
+        dx_win=dx_win,
+        refine_prob_min=refine_prob_min,
+        max_gap_rows=max_gap_rows,
+        max_dx=max_dx,
+        prob_bridge_min=prob_bridge_min,
+
+        # dedupe
+        dedupe_enable=dedupe_enable,
+        dedupe_min_rows=dedupe_min_rows,
+        dedupe_min_score=dedupe_min_score,
+        dedupe_overlap_iou=dedupe_overlap_iou,
+        dedupe_dx_tol=dedupe_dx_tol,
+
+        # debug (NEW)
+        debug_save_images=debug_save_images,
     )
     return _runner, kwargs, 'onnx'
 

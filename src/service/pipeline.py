@@ -113,13 +113,10 @@ def _build_overlay_json(
     For each track (.npy):
       - poly: [[x,y], ...]  (raw coordinates as stored)
       - peaks: [int, ...]   (indices of peaks found in residual)
+      - peak_amplitudes: [float, ...]  (residual height at each peak)
       - metrics: {dominant_frequency, period, num_peaks, mean_amplitude}
       - sample: heuristic sample name
       - id: track filename stem (e.g., "102")
-
-    Notes:
-      - We recompute residual/peaks here (fast) to keep this independent
-        of the CSV generation.
     """
     detrend_cfg = cfg.get("detrend", {}) or {}
     peaks_cfg = cfg.get("peaks", {}) or {}
@@ -157,6 +154,7 @@ def _build_overlay_json(
                 "sample": _sample_name_from_arr_path(arr),
                 "poly": xy.astype(float).tolist(),
                 "peaks": [int(i) for i in peaks_idx.tolist()],
+                "peak_amplitudes": ([float(a) for a in amps.tolist()] if amps.size else []),
                 "metrics": metrics,
             })
         except Exception as e:
@@ -164,6 +162,7 @@ def _build_overlay_json(
                 log.debug(f"overlay: failed on {arr.name}: {e}")
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    # keep compact (no indent) to avoid bloating large projects
     with open(save_path, "w") as f:
         json.dump(payload, f)
     return save_path
@@ -222,9 +221,13 @@ def iter_run_project(
     # prefer existing .npy tracks
     npy_files = list(input_dir.rglob(track_glob))
     arr_paths: List[Path] = []
+    image_count: int = 0  # for manifest
 
     if npy_files:
         arr_paths = sorted(map(Path, npy_files))
+        # best-effort inference: count unique "<sample>_heatmap" bases
+        bases = {p.parent.parent for p in arr_paths}
+        image_count = len(bases)
         yield JobEvent("DISCOVER", f"Found {len(arr_paths)} track arrays (.npy); skipping KymoButler", 0.05)
     else:
         # gather images
@@ -269,6 +272,7 @@ def iter_run_project(
         all_images = list(map(Path, img_files)) + generated_imgs
         # filter visualization outputs
         all_images = [p for p in all_images if not _is_overlay(p)]
+        image_count = len(all_images)
 
         if not all_images:
             msg = "No images, tables, or track arrays found under input directory"
@@ -385,9 +389,9 @@ def iter_run_project(
     # small manifest for reproducibility
     manifest = {
         "backend": backend,
-        "num_images": len(arr_paths),
-        "num_tracks": len(df_tracks),
-        "num_waves": len(df_waves),
+        "num_images": int(image_count),
+        "num_tracks": int(len(df_tracks)),
+        "num_waves": int(len(df_waves)),
         "config_path": str(Path(config_path)),
         "output_dir": str(tracks_out),
         "plots_dir": str(plots_dir) if plots_dir else None,
@@ -447,9 +451,6 @@ def run_project(
             last_evt = evt
             _emit(progress_cb, evt)
 
-            if evt.phase == "WRITE" and evt.extra:
-                # best-effort counts read from manifest at the end too
-                pass
             if evt.phase == "ERROR":
                 error = evt.message
                 break

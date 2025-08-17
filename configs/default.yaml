@@ -40,6 +40,13 @@ viz:
   hist_bins: 20
   dpi: 180
 
+features:
+  fit_window_period_frac: 0.5
+  classify:
+    ripple_max_deg: 10
+    surf_min_deg: 20
+    prominence_min_px: 1.0
+
 # ----------------------------------------------------
 # KymoButler pipeline configuration
 # ----------------------------------------------------
@@ -86,12 +93,12 @@ kymo:
       min_rows: 5
 
     skeleton:
-      method: thin             # "thin" | "zhangsuen"
+      method: thin             # "thin" | "zhangsuen" (adapter currently uses 'thin')
       prune_iters: 0           # WL Pruning[..., k]
       keep_ratio: 0.60         # adaptive corridor keep ratio (0..1)
       keep_min_px: 2000        # absolute min pixels to keep
-      prob_floor_min: 0.06     # clamp p10 floor lower bound
-      prob_floor_max: 0.10     # clamp p10 floor upper bound
+      prob_floor_min: 0.06     # clamp p10 floor lower bound (NEW: adapter honors)
+      prob_floor_max: 0.10     # clamp p10 floor upper bound (NEW: adapter honors)
 
     # Tracking & post-processing
     tracking:
@@ -102,7 +109,7 @@ kymo:
     postproc:
       extend_rows: 22
       dx_win: 4
-      prob_min: 0.11
+      prob_min: 0.11          # mapped to refine_prob_min in adapter
       max_gap_rows: 13
       max_dx: 6
       prob_bridge_min: 0.11
@@ -114,7 +121,7 @@ kymo:
         dx_tol: 2.5
 
     debug:
-      save_debug_images: true
+      save_debug_images: true  # NEW: adapter now gates file writes on this
 
   # ---------------- Wolfram backend options ----------------
   wolfram:

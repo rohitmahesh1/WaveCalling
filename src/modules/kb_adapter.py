@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Union, List, Tuple, Optional, Dict
+
 import numpy as np
 import cv2
 from skimage.filters import apply_hysteresis_threshold
@@ -16,6 +17,30 @@ from .kymobutler_pt import (
 
 # tracker bits
 from .tracker import CrossingTracker, Track, enforce_one_point_per_row
+
+
+# ---------------------------
+# Small helpers
+# ---------------------------
+
+def _auto_threshold(prob: np.ndarray,
+                    sweep: Tuple[float, float, int] = (0.12, 0.30, 19),
+                    target_mask_pct: Tuple[float, float] = (15.0, 25.0)) -> float:
+    """
+    Sweep thresholds in [lo, hi] (N steps). Pick thr whose mask density is
+    closest to the midpoint of the target band.
+    """
+    lo, hi, N = float(sweep[0]), float(sweep[1]), int(sweep[2])
+    thr_candidates = np.linspace(lo, hi, max(2, N))
+    target_mid = 0.5 * (float(target_mask_pct[0]) + float(target_mask_pct[1]))
+    best_thr, best_err = thr_candidates[0], 1e9
+    for t in thr_candidates:
+        m = prob_to_mask(prob, thr=float(t))  # expected 0/1 mask
+        pct = float(m.mean()) * 100.0
+        err = abs(pct - target_mid)
+        if err < best_err:
+            best_thr, best_err = float(t), err
+    return float(best_thr)
 
 
 # ---------------------------
@@ -326,8 +351,10 @@ def run_kymobutler(
     fuse_uni_weight: float = 0.7,
 
     # skeleton guardrails (to avoid over-trimming)
-    skel_keep_ratio: float = 0.60,     # keep at least this fraction of base skel px
-    skel_keep_min_px: Optional[int] = None,  # absolute min; if None, computed from base
+    skel_keep_ratio: float = 0.60,             # keep at least this fraction of base skel px
+    skel_keep_min_px: Optional[int] = None,    # absolute min; if None, computed from base
+    skel_prob_floor_min: float = 0.06,         # clamp floor lower bound
+    skel_prob_floor_max: float = 0.10,         # clamp floor upper bound
 
     # refine/merge toggles
     refine_enable: bool = True,
@@ -344,6 +371,9 @@ def run_kymobutler(
     dedupe_min_score: float = 0.11,
     dedupe_overlap_iou: float = 0.80,
     dedupe_dx_tol: float = 2.5,
+
+    # debug file outputs
+    debug_save_images: bool = True,
 
     # accept unknown kwargs without breaking (future-proof with YAML)
     **_
@@ -375,10 +405,10 @@ def run_kymobutler(
         print(f"[classify] probs={cls['probs']} -> mode={mode}" + (" [forced]" if force_mode else ""))
 
     # thresholds
-    t_uni = thr if thr_uni is None else thr_uni
-    t_bi  = thr if thr_bi  is None else thr_bi
+    t_uni = thr if thr_uni is None else float(thr_uni)
+    t_bi  = thr if thr_bi  is None else float(thr_bi)
 
-    # segmentation (original-size prob maps; ensure these methods exist in KymoButlerPT)
+    # segmentation (original-size prob maps)
     if mode == "uni":
         out = kb.segment_uni_full(gray_orig)
         prob = np.maximum(out["ant"], out["ret"]).astype(np.float32)
@@ -396,7 +426,7 @@ def run_kymobutler(
         used_thr = float(t_bi)
 
     # threshold + WL-like shaping
-    mask0 = prob_to_mask(prob, thr=used_thr)
+    mask0 = prob_to_mask(prob, thr=used_thr)  # expected 0/1 uint8
 
     hmask = None
     if hysteresis_enable:
@@ -419,21 +449,22 @@ def run_kymobutler(
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    elif directional_close:
-        kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(dir_kv))))
-        kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(dir_kh)), 1))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kv)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kh)
-        if diag_bridge:
-            kdl = np.array([[1, 0, 1],
-                            [0, 1, 0],
-                            [1, 0, 1]], dtype=np.uint8)
-            kcr = np.array([[0, 1, 0],
-                            [1, 1, 1],
-                            [0, 1, 0]], dtype=np.uint8)
-            mask_dl = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kdl)
-            mask_cr = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kcr)
-            mask = np.maximum(mask, np.maximum(mask_dl, mask_cr)).astype(np.uint8)
+    else:
+        if directional_close:
+            kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(dir_kv))))
+            kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(dir_kh)), 1))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kv)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kh)
+            if diag_bridge:
+                kdl = np.array([[1, 0, 1],
+                                [0, 1, 0],
+                                [1, 0, 1]], dtype=np.uint8)
+                kcr = np.array([[0, 1, 0],
+                                [1, 1, 1],
+                                [0, 1, 0]], dtype=np.uint8)
+                mask_dl = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kdl)
+                mask_cr = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kcr)
+                mask = np.maximum(mask, np.maximum(mask_dl, mask_cr)).astype(np.uint8)
 
     # component filter prior to skeletonization
     mask_f = filter_components(mask, min_px=comp_min_px, min_rows=comp_min_rows)
@@ -442,7 +473,7 @@ def run_kymobutler(
     skel_base = _thin(mask_f.astype(bool)).astype(np.uint8)
     BASE_PX = int(skel_base.sum())
     if skel_keep_min_px is None:
-        MIN_KEEP_PX = max(2000, int(float(skel_keep_ratio) * BASE_PX))
+        MIN_KEEP_PX = max(2000, int(float(skel_keep_ratio) * max(1, BASE_PX)))
     else:
         MIN_KEEP_PX = int(skel_keep_min_px)
 
@@ -452,7 +483,12 @@ def run_kymobutler(
         corridor = (skel == 1) & (deg <= 2)
         vals = prob[skel == 1]
         p10 = float(np.percentile(vals, 10.0)) if vals.size else 0.08
-        PROB_FLOOR = min(0.10, max(0.06, p10))
+        # clamp using YAML-configured min/max
+        lo = float(skel_prob_floor_min)
+        hi = float(skel_prob_floor_max)
+        if hi < lo:  # safety swap
+            hi, lo = lo, hi
+        PROB_FLOOR = max(lo, min(hi, p10))
         to_drop = corridor & (prob < PROB_FLOOR)
         skel[to_drop] = 0
         skel = _thin(skel.astype(bool)).astype(np.uint8)
@@ -477,6 +513,10 @@ def run_kymobutler(
         print("[debug.skel] base_px:", BASE_PX,
               " final_px:", int(skel.sum()),
               " keep_floor:", MIN_KEEP_PX)
+        print("[debug] prob range:", float(prob.min()), "→", float(prob.max()),
+              "  thr_used:", used_thr)
+
+    if debug_save_images:
         dbg = base_dir / "debug"
         dbg.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(dbg / "prob.png"), (prob * 255).astype(np.uint8))
@@ -486,12 +526,15 @@ def run_kymobutler(
         cv2.imwrite(str(dbg / "skeleton.png"), (skel * 255))
         if hmask is not None:
             cv2.imwrite(str(dbg / "mask_hysteresis.png"), (hmask.astype(np.uint8) * 255))
-        print("[debug] prob range:", float(prob.min()), "→", float(prob.max()),
-              "  mask_raw %:", round(pct0, 2),
-              "  thr_used:", used_thr,
-              "  mask_clean %:", round(float(mask.mean()) * 100.0, 2),
-              "  mask_filtered %:", round(float(mask_f.mean()) * 100.0, 2),
-              "  skel_px:", int(skel.sum()))
+        # quick stats
+        with open(dbg / "stats.txt", "w") as f:
+            pct_raw = float(mask0.mean()) * 100.0
+            pct_clean = float(mask.mean()) * 100.0
+            pct_filt = float(mask_f.mean()) * 100.0
+            f.write(f"prob_min={float(prob.min()):.6f} prob_max={float(prob.max()):.6f}\n")
+            f.write(f"thr_used={used_thr:.6f}\n")
+            f.write(f"mask_raw_pct={pct_raw:.2f} mask_clean_pct={pct_clean:.2f} mask_filtered_pct={pct_filt:.2f}\n")
+            f.write(f"skel_px_base={BASE_PX} skel_px_final={int(skel.sum())} keep_floor={MIN_KEEP_PX}\n")
 
     # tracking on seg-sized, WL-preprocessed gray aligned to prob shape
     gray_seg = kb.preproc_for_seg(gray_orig, hw=prob.shape)  # ensure your KymoButlerPT supports hw=(H,W)
@@ -539,7 +582,7 @@ def run_kymobutler(
     if verbose:
         print(f"[kymobutler_pt] extracted {len(tracks)} track(s); saved {saved} ≥ {min_length} to {out_dir}")
 
-    if verbose:
+    if debug_save_images:
         overlay = cv2.cvtColor(gray_orig, cv2.COLOR_GRAY2BGR)
         for t in tracks:
             for y, x in t.points:

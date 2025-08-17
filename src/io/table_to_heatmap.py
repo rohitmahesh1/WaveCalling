@@ -1,6 +1,5 @@
 from pathlib import Path
 import os
-import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -94,7 +93,11 @@ def table_to_heatmap(
     os.makedirs(out_dir, exist_ok=True)
 
     df = _load_table(table_path)
+
+    # Convert to float and sanitize NaN/Inf
     data = df.to_numpy(dtype=float)
+    if not np.isfinite(data).all():
+        data = np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     # keep extremes and optionally binarize
     filtered = _keep_extremes_zero_middle(data, lower, upper)
@@ -109,11 +112,11 @@ def table_to_heatmap(
     out_path = out_dir / out_name
 
     # plot
-    plt.figure(figsize=(8, 6), dpi=dpi if dpi else None)
-    vmax = np.max(filtered) if filtered.size else 1.0
+    plt.figure(figsize=(8, 6), dpi=(dpi if dpi else None))
+    vmax = float(np.max(filtered)) if filtered.size else 1.0
     plt.imshow(filtered, cmap=cmap, interpolation="nearest", vmin=0, vmax=vmax, origin=origin)
     plt.axis("off")
-    plt.savefig(out_path, bbox_inches="tight", pad_inches=0, dpi=dpi if dpi else None)
+    plt.savefig(out_path, bbox_inches="tight", pad_inches=0, dpi=(dpi if dpi else None))
     plt.close()
 
     return out_path, nrows, ncols
