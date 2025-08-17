@@ -31,3 +31,10 @@ export/
 
 # ignore runs/
 runs/
+
+# frontend-related files
+node_modules
+dist
+frontend/web
+.DS_Store
+.env
