@@ -1,6 +1,7 @@
 # src/service/api.py
 from __future__ import annotations
 import os
+# Ensure headless plotting in worker threads (must be set BEFORE any Matplotlib import anywhere)
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import re
@@ -9,13 +10,13 @@ import json
 import shutil
 import uuid
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -46,6 +47,7 @@ app.add_middleware(
 # Expose the runs directory for downloading artifacts (CSV/plots/overlay)
 app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
 
+# Static smoke-test UI (keep during dev; React/Vite build will be mounted at /app later)
 app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
 
@@ -56,7 +58,7 @@ class RunInfo(BaseModel):
     run_id: str
     name: str
     created_at: str
-    status: str                 # QUEUED | RUNNING | DONE | ERROR
+    status: str                 # QUEUED | RUNNING | DONE | ERROR | CANCELLED
     error: Optional[str] = None
     input_dir: str
     output_dir: str
@@ -79,11 +81,13 @@ class _RunState:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.status = "QUEUED"
         self.error: Optional[str] = None
 
-        # Each subscriber gets its own queue; publisher fan-outs events to all
+        self.cancel_event: asyncio.Event = asyncio.Event()
+        self.worker_task: Optional[asyncio.Task] = None
+
         self._subscribers: List[asyncio.Queue] = []
         self._sub_lock = asyncio.Lock()
 
@@ -189,6 +193,7 @@ def _artifact_urls(state: _RunState) -> Dict[str, str]:
     overlay_json = Path(base) / "output" / "overlay" / "tracks.json"
     manifest_json = Path(base) / "output" / "manifest.json"
     plots_dir = Path(base) / "plots"
+    base_image = Path(base) / "output" / "base.png"
 
     return {
         "tracks_csv": str(tracks_csv),
@@ -197,30 +202,31 @@ def _artifact_urls(state: _RunState) -> Dict[str, str]:
         "manifest_json": str(manifest_json),
         "plots_dir": str(plots_dir),
         "output_dir": str(Path(base) / "output"),
+        "base_image": str(base_image),
     }
 
 
 async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verbose: bool) -> None:
-    """
-    Execute the pipeline in a background thread and forward JobEvents to subscribers.
-    This prevents blocking the asyncio event loop so SSE can flush in real time.
-    """
     state.status = "RUNNING"
     loop = asyncio.get_running_loop()
     bridge_q: asyncio.Queue[JobEvent] = asyncio.Queue()
 
     def _runner_sync():
-        """Runs in a worker thread; pushes JobEvents back to the main loop via bridge_q."""
+        got_terminal = False
         try:
             for evt in iter_run_project(
                 input_dir=state.input_dir,
                 config_path=state.config_path,
                 output_dir=state.output_dir,
                 plots_out=state.plots_dir,
-                progress_cb=None,                 # events go via bridge_q
+                progress_cb=None,  # events go via bridge_q
                 config_overrides=config_overrides,
                 verbose=verbose,
+                # PASS CANCELLATION HERE
+                cancel_cb=lambda: state.cancel_event.is_set(),
             ):
+                if evt.phase in ("DONE", "ERROR", "CANCELLED"):
+                    got_terminal = True
                 asyncio.run_coroutine_threadsafe(bridge_q.put(evt), loop)
         except Exception as e:
             asyncio.run_coroutine_threadsafe(
@@ -228,36 +234,35 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
                 loop,
             )
         finally:
-            # ensure a terminal event even if the generator didn't yield one
-            asyncio.run_coroutine_threadsafe(
-                bridge_q.put(JobEvent(phase="DONE", message="Run finished", progress=1.0)),
-                loop,
-            )
+            if not got_terminal:
+                asyncio.run_coroutine_threadsafe(
+                    bridge_q.put(JobEvent(phase="DONE", message="Run finished", progress=1.0)),
+                    loop,
+                )
 
-    # IMPORTANT: actually schedule the worker
-    worker_task = asyncio.create_task(asyncio.to_thread(_runner_sync))
+    # Track worker so we can await it on shutdown or after cancel
+    state.worker_task = asyncio.create_task(asyncio.to_thread(_runner_sync))
 
     try:
         while True:
             evt: JobEvent = await bridge_q.get()
-            # update run state on terminal phases
-            if evt.phase in ("ERROR", "DONE"):
+            if evt.phase in ("ERROR", "DONE", "CANCELLED"):
                 state.status = evt.phase
                 if evt.phase == "ERROR":
                     state.error = evt.message or "Unknown error"
             await state.publish(evt)
-            if evt.phase in ("ERROR", "DONE"):
+            if evt.phase in ("ERROR", "DONE", "CANCELLED"):
                 break
 
         # wait for the worker to finish cleanly
-        await worker_task
+        await state.worker_task
 
     except Exception as e:
         state.status = "ERROR"
         state.error = str(e)
         await state.publish(JobEvent(phase="ERROR", message=str(e), progress=1.0))
     finally:
-        terminal = "DONE" if state.status == "DONE" else "ERROR"
+        terminal = state.status if state.status in ("DONE", "ERROR", "CANCELLED") else "ERROR"
         await state.publish(JobEvent(phase=terminal, message="Run finished", progress=1.0))
 
 
@@ -291,6 +296,8 @@ async def create_run(
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     # Resolve config (copy default next to run for traceability)
+    if not DEFAULT_CONFIG.exists():
+        raise HTTPException(status_code=500, detail=f"Default config not found: {DEFAULT_CONFIG}")
     config_path = base_dir / "config.yaml"
     shutil.copyfile(DEFAULT_CONFIG, config_path)
 
@@ -350,6 +357,46 @@ async def stream_events(run_id: str):
 
     q = await st.add_subscriber()
 
+    def _to_url(p: str) -> str:
+        """Map a local file path to its served URL under /runs/<id>/..."""
+        try:
+            p_path = Path(p)
+            # output dir
+            try:
+                rel = p_path.relative_to(st.output_dir)
+                return f"/runs/{st.run_id}/output/{rel.as_posix()}"
+            except ValueError:
+                pass
+            # plots dir
+            try:
+                rel = p_path.relative_to(st.plots_dir)
+                return f"/runs/{st.run_id}/plots/{rel.as_posix()}"
+            except ValueError:
+                pass
+            # base dir as a fallback
+            try:
+                rel = p_path.relative_to(st.base_dir)
+                return f"/runs/{st.run_id}/{rel.as_posix()}"
+            except ValueError:
+                pass
+        except Exception:
+            pass
+        return p  # if already URL-like or unknown root
+
+    def _rewrite_payload(payload: dict) -> dict:
+        extra = payload.get("extra")
+        if isinstance(extra, dict):
+            new_extra = {}
+            for k, v in extra.items():
+                if isinstance(v, str):
+                    new_extra[k] = _to_url(v)
+                elif isinstance(v, list):
+                    new_extra[k] = [_to_url(x) if isinstance(x, str) else x for x in v]
+                else:
+                    new_extra[k] = v
+            payload["extra"] = new_extra
+        return payload
+
     async def gen():
         try:
             # push an initial status snapshot to new subscribers
@@ -357,13 +404,78 @@ async def stream_events(run_id: str):
             while True:
                 evt: JobEvent = await q.get()
                 payload = asdict(evt)
+                payload = _rewrite_payload(payload)
                 yield {"event": "message", "data": json.dumps(payload)}
                 if evt.phase in ("DONE", "ERROR"):
                     break
         finally:
             await st.remove_subscriber(q)
 
-    return EventSourceResponse(gen())
+    # ping keeps the connection alive through proxies (seconds)
+    return EventSourceResponse(gen(), ping=15)
+
+
+@app.get("/api/runs/{run_id}/overlay")
+async def get_overlay(run_id: str):
+    """Return overlay JSON (tracks.json or partial if still running)."""
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    # Prefer final file, fall back to partial if present
+    final = st.output_dir / "overlay" / "tracks.json"
+    partial = st.output_dir / "overlay" / "tracks.partial.json"
+    path = final if final.exists() else partial
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Overlay not available yet")
+    with open(path) as f:
+        data = json.load(f)
+    return JSONResponse(data)
+
+
+@app.get("/api/runs/{run_id}/image")
+async def get_base_image(run_id: str):
+    """Serve the base image used for overlay (copied by the pipeline as base.png)."""
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    img = st.output_dir / "base.png"
+    if not img.exists():
+        raise HTTPException(status_code=404, detail="Base image not available yet")
+    return FileResponse(str(img), media_type="image/png")
+
+
+@app.get("/api/runs/{run_id}/waves")
+async def list_wave_windows(run_id: str, track: Optional[str] = None):
+    """List PNGs under plots/<track>/peak_windows (as /runs URLs)."""
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    if not track:
+        raise HTTPException(status_code=400, detail="Query param 'track' is required")
+    win_dir = st.plots_dir / str(track) / "peak_windows"
+    if not win_dir.exists():
+        return JSONResponse({"images": []})
+    files = sorted([p for p in win_dir.glob("*.png")])
+    urls = [f"/runs/{st.run_id}/plots/{track}/peak_windows/{p.name}" for p in files]
+    return JSONResponse({"images": urls})
+
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    """
+    Signal a running job to stop early. The pipeline will:
+      - Finish the current micro-step,
+      - Write partial artifacts (.partial.csv / tracks.partial.json),
+      - Emit a CANCELLED terminal event.
+    """
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    if st.status not in ("QUEUED", "RUNNING"):
+        return {"run_id": run_id, "status": st.status, "message": "Run is not active"}
+
+    # flip the flag; the generator will exit soon
+    st.cancel_event.set()
+    return {"run_id": run_id, "status": "CANCEL_REQUESTED"}
 
 
 # Dev convenience: run with `python -m src.service.api`
@@ -378,4 +490,3 @@ if __name__ == "__main__":
         reload_includes=["src/*", "web/*", "configs/*"],
         reload_excludes=["runs/*", "out/*", "data/generated_heatmaps/*"],
     )
-

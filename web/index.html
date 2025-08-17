@@ -94,8 +94,19 @@
             if (evt.phase === "WRITE_PARTIAL" && evt.extra) {
                 const p1 = evt.extra.tracks_partial;
                 const p2 = evt.extra.waves_partial;
-                // show clickable links
-                log(`Partial: <a href="${p1}" target="_blank">metrics.partial.csv</a>, <a href="${p2}" target="_blank">metrics_waves.partial.csv</a>`);
+                log(`Partial: <a href="${p1}" target="_blank">metrics.partial.csv</a>, ` +
+                    `<a href="${p2}" target="_blank">metrics_waves.partial.csv</a>`);
+                document.getElementById("partialLinks").innerHTML =
+                    `<a href="${p1}" target="_blank">metrics.partial.csv</a> · ` +
+                    `<a href="${p2}" target="_blank">metrics_waves.partial.csv</a>`;
+                }
+            if (evt.phase === "WRITE" && evt.extra) {
+            const { tracks_csv, waves_csv, overlay_json, manifest_json } = evt.extra;
+            document.getElementById("finalLinks").innerHTML =
+                `<a href="${tracks_csv}" target="_blank">metrics.csv</a> · ` +
+                `<a href="${waves_csv}" target="_blank">metrics_waves.csv</a> · ` +
+                `<a href="${overlay_json}" target="_blank">overlay</a> · ` +
+                `<a href="${manifest_json}" target="_blank">manifest.json</a>`;
             }
 
             if (evt.phase === 'DONE') {
@@ -131,5 +142,7 @@
       }
     });
   </script>
+  <div id="partialLinks"></div>
+  <div id="finalLinks"></div>
 </body>
 </html>
