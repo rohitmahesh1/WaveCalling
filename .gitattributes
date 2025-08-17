@@ -1,1 +1,3 @@
 *.wls linguist-language=Mathematica
+*.ts   linguist-language=TypeScript
+*.tsx  linguist-language=TSX
