@@ -23,6 +23,7 @@ from .pipeline import iter_run_project, JobEvent
 # ---- Config ----
 APP_ROOT = Path(__file__).resolve().parents[2]  # repo root
 DEFAULT_CONFIG = APP_ROOT / "configs" / "default.yaml"
+WEB_DIR = APP_ROOT / "web"
 RUNS_ROOT = APP_ROOT / "runs"
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -41,6 +42,9 @@ app.add_middleware(
 
 # Expose the runs directory for downloading artifacts (CSV/plots/overlay)
 app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
+
+app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+
 
 
 # -----------------------
