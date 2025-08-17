@@ -1,6 +1,6 @@
 # src/service/api.py
 from __future__ import annotations
-
+import re
 import asyncio
 import json
 import shutil
@@ -43,8 +43,7 @@ app.add_middleware(
 # Expose the runs directory for downloading artifacts (CSV/plots/overlay)
 app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
 
-app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
-
+app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
 
 # -----------------------
@@ -143,16 +142,37 @@ class RunStatusResponse(BaseModel):
 # -----------------------
 # Helpers
 # -----------------------
-def _save_uploads(files: List[UploadFile], dest_dir: Path) -> List[Path]:
-    saved: List[Path] = []
-    for f in files:
-        # preserve original filename
-        out_path = dest_dir / Path(f.filename).name
-        with out_path.open("wb") as w:
-            shutil.copyfileobj(f.file, w)
-        saved.append(out_path)
-    return saved
 
+async def _save_uploads(files, out_dir: Path) -> list[Path]:
+    """
+    Save FastAPI UploadFile objects into out_dir.
+    - Ensures the directory exists.
+    - Sanitizes filenames.
+    - Streams in chunks to avoid large memory spikes.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _safe_name(name: str) -> str:
+        # Keep basename only, strip directories, and allow [A-Za-z0-9._-]
+        base = Path(name or "upload.bin").name
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+
+    saved_paths: list[Path] = []
+    for uf in files or []:
+        fname = _safe_name(getattr(uf, "filename", "") or "upload.bin")
+        out_path = out_dir / fname
+
+        # Stream to disk
+        with out_path.open("wb") as w:
+            while True:
+                chunk = await uf.read(64 * 1024)
+                if not chunk:
+                    break
+                w.write(chunk)
+        await uf.close()
+        saved_paths.append(out_path)
+
+    return saved_paths
 
 def _artifact_urls(state: _RunState) -> Dict[str, str]:
     """
@@ -236,10 +256,10 @@ async def create_run(
     """
     run_id = uuid.uuid4().hex[:10]
     base_dir = RUNS_ROOT / run_id
-    base_dir.mkdir(parents=True, exist_ok=True)
+    (base_dir / "input").mkdir(parents=True, exist_ok=True)
 
     # Save inputs
-    saved = _save_uploads(files, base_dir / "input")
+    saved = await _save_uploads(files, base_dir / "input")
     if not saved:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
