@@ -37,4 +37,5 @@ node_modules
 dist
 frontend/web
 .DS_Store
+.env.example
 .env
