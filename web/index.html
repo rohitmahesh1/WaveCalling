@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WaveCalling – Quick Test UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --fg:#111; --muted:#666; --bg:#fff; --accent:#0a7; --err:#c33; --border:#e5e5e5; }
+    * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    body { margin: 0; background: var(--bg); color: var(--fg); }
+    header { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+    main { max-width: 1100px; margin: 20px auto; padding: 0 16px 40px; }
+    h1 { margin: 0; font-size: 18px; }
+    .card { border:1px solid var(--border); border-radius: 10px; padding:16px; margin-bottom:16px; background:#fff; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .col { flex:1 1 360px; min-width: 280px; }
+    label { font-size: 13px; color: var(--muted); display:block; margin-bottom:6px; }
+    input[type="file"] { width:100%; padding:10px; border:1px dashed var(--border); border-radius:8px; background:#fafafa; }
+    textarea { width:100%; height:120px; padding:10px; border:1px solid var(--border); border-radius:8px; resize:vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .btn { display:inline-flex; align-items:center; gap:8px; padding:10px 14px; background:var(--accent); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; }
+    .btn[disabled] { opacity:.6; cursor:not-allowed; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .progress { height:10px; width:100%; background:#f1f1f1; border-radius:999px; overflow:hidden; border:1px solid var(--border); }
+    .progress > div { height:100%; width:0%; background:var(--accent); transition: width 200ms linear; }
+    pre { background:#0c0c0c; color:#d5d5d5; padding:12px; border-radius:8px; overflow:auto; max-height:280px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .links a { display:inline-block; margin-right:10px; margin-bottom:6px; text-decoration:none; color:#0366d6; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid var(--border); }
+    .err { color: var(--err); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WaveCalling – Quick Test UI</h1>
+  </header>
+
+  <main>
+    <div class="card">
+      <div class="row">
+        <div class="col">
+          <label>Upload CSV/XLS/PNG/JPG (one or many)</label>
+          <input id="files" type="file" multiple />
+          <div id="fileList" class="muted" style="margin-top:8px;"></div>
+        </div>
+        <div class="col">
+          <label>Config overrides (JSON, optional)</label>
+          <textarea id="overrides" placeholder='e.g. {"viz":{"enabled":true},"kymo":{"onnx":{"thresholds":{"thr_default":0.22}}}}'></textarea>
+          <label style="margin-top:8px;"><input id="verbose" type="checkbox" /> Verbose</label>
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <button id="startBtn" class="btn" onclick="startRun()">Start Run</button>
+        <span id="status" class="pill" style="margin-left:10px;">ID: —</span>
+      </div>
+      <div style="margin-top:12px;" class="progress"><div id="bar"></div></div>
+      <div class="muted" style="margin-top:6px;">Watch live events below; artifacts appear when done.</div>
+    </div>
+
+    <div class="card">
+      <label>Events</label>
+      <pre id="events"><code>Waiting…</code></pre>
+    </div>
+
+    <div class="card">
+      <label>Artifacts</label>
+      <div id="artifacts" class="links muted">None yet</div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmt = (o) => JSON.stringify(o, null, 2);
+
+    $("files").addEventListener("change", () => {
+      const names = Array.from($("files").files).map(f => f.name);
+      $("fileList").textContent = names.length ? names.join(", ") : "No files selected";
+    });
+
+    async function startRun() {
+      const files = $("files").files;
+      if (!files || files.length === 0) {
+        alert("Please choose at least one file.");
+        return;
+      }
+
+      $("startBtn").disabled = true;
+      $("events").textContent = "Uploading…";
+      $("artifacts").textContent = "None yet";
+      $("bar").style.width = "0%";
+      $("status").textContent = "ID: —";
+
+      const fd = new FormData();
+      for (const f of files) fd.append("files", f, f.name);
+      const overrides = $("overrides").value.trim();
+      if (overrides) fd.append("config_overrides", overrides);
+      fd.append("verbose", $("verbose").checked ? "true" : "false");
+
+      // create run
+      const res = await fetch("/api/runs", { method: "POST", body: fd });
+      if (!res.ok) {
+        const t = await res.text();
+        $("events").innerHTML = `<code class="err">Create run failed: ${res.status} ${t}</code>`;
+        $("startBtn").disabled = false;
+        return;
+      }
+      const created = await res.json();
+      const runId = created.run_id;
+      $("status").textContent = `ID: ${runId}`;
+      $("events").textContent = "";
+
+      // subscribe to SSE
+      const es = new EventSource(`/api/runs/${runId}/events`);
+      es.onmessage = (e) => {
+        try {
+          const evt = JSON.parse(e.data);
+          appendEvent(evt);
+          if (typeof evt.progress === "number") {
+            $("bar").style.width = Math.max(0, Math.min(1, evt.progress)) * 100 + "%";
+          }
+          if (evt.phase === "DONE" || evt.phase === "ERROR") {
+            es.close();
+            $("startBtn").disabled = false;
+            refreshArtifacts(runId);
+          }
+        } catch (err) {
+          appendEvent({ phase: "ERROR", message: "bad SSE payload: " + err, progress: 1 });
+        }
+      };
+      es.onerror = () => {
+        // the server also sends a terminal DONE/ERROR; if we get an error here, just leave the stream
+        appendEvent({ phase: "SSE", message: "event stream ended", progress: 1 });
+      };
+    }
+
+    function appendEvent(evt) {
+      const now = new Date().toLocaleTimeString();
+      const line = `[${now}] ${evt.phase}: ${evt.message}`;
+      const pre = $("events");
+      pre.textContent = pre.textContent === "Waiting…" ? line : pre.textContent + "\n" + line;
+      pre.scrollTop = pre.scrollHeight;
+    }
+
+    async function refreshArtifacts(runId) {
+      try {
+        const res = await fetch(`/api/runs/${runId}`);
+        if (!res.ok) throw new Error(await res.text());
+        const { artifacts } = await res.json();
+
+        const links = [];
+        // Only show links that actually exist (HEAD check)
+        for (const [label, url] of Object.entries(artifacts)) {
+          const ok = await headOk(url);
+          if (ok) {
+            links.push(`<a href="${url}" target="_blank" rel="noopener">${label}</a>`);
+          }
+        }
+        $("artifacts").classList.remove("muted");
+        $("artifacts").innerHTML = links.length ? links.join(" • ") : "No artifacts found yet.";
+      } catch (e) {
+        $("artifacts").innerHTML = `<span class="err">Failed to load artifacts: ${e}</span>`;
+      }
+    }
+
+    async function headOk(url) {
+      try {
+        const r = await fetch(url, { method: "HEAD" });
+        return r.ok;
+      } catch {
+        return false;
+      }
+    }
+  </script>
+</body>
+</html>
