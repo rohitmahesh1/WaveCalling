@@ -19,6 +19,13 @@ from .visualize import (
 # I/O for tables → heatmaps
 from .io.table_to_heatmap import table_to_heatmap
 
+# NEW: features (wave rows builder, ids, etc.)
+from .features import (
+    build_wave_rows,
+    sample_id_from_name,
+    coerce_track_id,
+)
+
 # utilities
 from .utils import (
     setup_logging,
@@ -42,59 +49,6 @@ def _sample_name_from_arr_path(arr_path: Path) -> str:
     return base
 
 
-def _waves_from_peaks(
-    x: np.ndarray,
-    y: np.ndarray,
-    residual: np.ndarray,
-    peaks_idx: np.ndarray,
-    sampling_rate: float,
-    sample: str,
-    track_stem: str,
-) -> list[dict]:
-    """
-    Build per-wave rows from consecutive peak pairs (k -> k+1).
-    """
-    rows: list[dict] = []
-    p = np.asarray(peaks_idx, dtype=int)
-    if p.size < 2:
-        return rows
-
-    for k in range(p.size - 1):
-        i, j = int(p[k]), int(p[k + 1])
-
-        frame1 = float(x[i])
-        frame2 = float(x[j])
-        period_frames = frame2 - frame1
-        period_s = period_frames / sampling_rate if sampling_rate else float("nan")
-        freq = (1.0 / period_s) if (period_s and period_s > 0) else float("nan")
-
-        pos1 = float(y[i])         # raw pixel position at first peak
-        pos2 = float(y[j])         # raw pixel position at second peak
-        amp = float(residual[i])   # amplitude at first peak (residual height)
-
-        dpos = pos2 - pos1
-        vel = (dpos / period_s) if (period_s and period_s != 0) else float("nan")
-        wavelength = abs(dpos)     # with peak-to-peak period, λ = |Δpos|
-
-        rows.append({
-            "Sample": sample,
-            "Track": track_stem,
-            "Wave number": k + 1,
-            "Frame position 1": frame1,
-            "Frame position 2": frame2,
-            "Period (frames)": period_frames,
-            "Period (s)": period_s,
-            "Frequency (Hz)": freq,
-            "Pixel position 1": pos1,
-            "Pixel position 2": pos2,
-            "Amplitude (pixels)": amp,
-            "Δposition (px)": dpos,
-            "Velocity (px/s)": vel,
-            "Wavelength (px)": wavelength,
-        })
-    return rows
-
-
 def process_track(
     arr_path: Path,
     detrend_cfg: dict,
@@ -107,9 +61,10 @@ def process_track(
     make_plot_spectrum: bool = True,
     dpi: int | None = None,
     log=None,
+    features_cfg: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """
-    Load a track (.npy), compute residual, detect peaks, estimate frequency,
+    Load a track (.npy), compute residual, detect peaks (+props), estimate frequency,
     make plots (optional), and return:
       (track_level_metrics_dict, [per-wave rows])
     """
@@ -121,8 +76,8 @@ def process_track(
     # detrend
     residual = detrend_residual(x, y, **detrend_cfg)
 
-    # detect peaks on residual
-    peaks_idx, _ = detect_peaks(residual, **peaks_cfg)
+    # detect peaks on residual (keep props!)
+    peaks_idx, props = detect_peaks(residual, **peaks_cfg)
 
     # global frequency and period
     freq = estimate_dominant_frequency(residual, **period_cfg)
@@ -130,13 +85,16 @@ def process_track(
 
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
 
-    # per-wave rows (peak -> next peak)
+    # per-wave rows (k -> k+1) with enriched features & anchored fit params
     sample_name = _sample_name_from_arr_path(arr_path)
-    wave_rows = _waves_from_peaks(
-        x, y, residual, peaks_idx,
+    wave_rows = build_wave_rows(
+        x=x, y=y, residual=residual,
+        peaks_idx=peaks_idx, peak_props=props,
         sampling_rate=sampling_rate if sampling_rate is not None else 1.0,
-        sample=sample_name,
-        track_stem=arr_path.stem,
+        sample=sample_name, track_stem=arr_path.stem,
+        features_cfg=features_cfg or {},
+        freq_hz=float(freq) if np.isfinite(freq) else None,
+        period_frac_for_fit=float((features_cfg or {}).get("fit_window_period_frac", 0.5)),
     )
 
     # optional plotting controlled by viz toggles
@@ -167,8 +125,8 @@ def process_track(
                         ransac_kwargs=ransac_kwargs,
                         sampling_rate=sampling_rate,
                         freq=freq,
-                        period_frac=0.5,   # show 0.5 of a period centered on each peak
-                        max_plots=12,      # cap to avoid huge directories
+                        period_frac=float((features_cfg or {}).get("fit_window_period_frac", 0.5)),
+                        max_plots=12,
                         dpi=dpi,
                         title_prefix=arr_path.stem,
                         overlay_fit=True,
@@ -190,8 +148,13 @@ def process_track(
                 if log:
                     log.debug(f'Plot spectrum failed for {arr_path.name}: {e}')
 
+    # Track-level metrics (+ IDs; non-breaking additions)
+    track_id = coerce_track_id(arr_path.stem)
     track_metrics = {
+        'sample': sample_name,
+        'sample_id': int(sample_id_from_name(sample_name)),
         'track': arr_path.stem,
+        'track_id': int(track_id) if track_id is not None else np.nan,
         'num_peaks': int(len(peaks_idx)),
         'mean_amplitude': float(np.mean(amps)) if amps.size > 0 else float('nan'),
         'median_amplitude': float(np.median(amps)) if amps.size > 0 else float('nan'),
@@ -228,9 +191,7 @@ def _build_kymo_runner(cfg, log, verbose):
         backend = 'onnx'
 
     if backend == 'wolfram':
-        # Wolfram backend (Mathematica scripts)
         from .modules.kymo_interface import run_kymobutler as _runner
-        # WL runner usually just needs min_length & verbose; keep future-proof kwargs minimal
         min_len = (
             _cfg_get(kymo_cfg, ['onx', 'tracking', 'min_length']) or
             kymo_cfg.get('min_length') or
@@ -247,84 +208,62 @@ def _build_kymo_runner(cfg, log, verbose):
 
     onnx_cfg = kymo_cfg.get('onnx', {}) or {}
 
-    # Model / segmentation
     export_dir   = onnx_cfg.get('export_dir', None)
     seg_size     = int(onnx_cfg.get('seg_size', 256))
-    force_mode   = onnx_cfg.get('force_mode', None)  # "uni"|"bi"|None
+    force_mode   = onnx_cfg.get('force_mode', None)
 
-    # Fuse uni into bi
     fuse_uni_into_bi = bool(onnx_cfg.get('fuse_uni_into_bi', True))
     fuse_uni_weight  = float(onnx_cfg.get('fuse_uni_weight', 0.7))
 
-    # Thresholds
     thr_cfg  = onnx_cfg.get('thresholds', {}) or {}
     thr      = float(thr_cfg.get('thr_default', 0.20))
     thr_bi   = thr_cfg.get('thr_bi', None)
     thr_uni  = thr_cfg.get('thr_uni', None)
 
-    # Auto threshold
     auto_cfg = onnx_cfg.get('auto_threshold', {}) or {}
     auto_threshold   = bool(auto_cfg.get('enabled', True))
     auto_sweep       = tuple(auto_cfg.get('sweep', [0.12, 0.30, 19]))
     auto_target_pct  = tuple(auto_cfg.get('target_mask_pct', [15.0, 25.0]))
     auto_trigger_pct = tuple(auto_cfg.get('trigger_pct', [5.0, 35.0]))
 
-    # Hysteresis
     hyst_cfg = onnx_cfg.get('hysteresis', {}) or {}
     hysteresis_enable = bool(hyst_cfg.get('enabled', True))
     hysteresis_low    = float(hyst_cfg.get('low', 0.08))
     hysteresis_high   = float(hyst_cfg.get('high', 0.18))
 
-    # Morphology
     morph = onnx_cfg.get('morphology', {}) or {}
     morph_mode = str(morph.get('mode', 'directional'))
     morph_close_open_close = (morph_mode == 'classic')
     directional_close      = (morph_mode == 'directional')
-    # directional kernel sizes (optional)
     dir_kv = int(_cfg_get(morph, ['directional', 'kv'], 5))
     dir_kh = int(_cfg_get(morph, ['directional', 'kh'], 5))
     diag_bridge = bool(_cfg_get(morph, ['directional', 'diag_bridge'], True))
-    # classic kernel (unused here; adapter uses fixed 3x3 ellipse)
-    _ = morph.get('classic', {})
 
-    # Components
     comp = onnx_cfg.get('components', {}) or {}
     comp_min_px   = int(comp.get('min_px', 5))
     comp_min_rows = int(comp.get('min_rows', 5))
 
-    # Skeleton
     skel = onnx_cfg.get('skeleton', {}) or {}
     prune_iters = int(skel.get('prune_iters', 0))
-    # keep_ratio, keep_min_px, floors are currently handled inside adapter; skip here
 
-    # Tracking
     track = onnx_cfg.get('tracking', {}) or {}
     min_length = int(track.get('min_length', 30))
-    # other tracking knobs are internal to adapter/tracker
 
-    # Build kwargs for kb_adapter.run_kymobutler (only pass what it supports)
     kwargs = dict(
         min_length=min_length,
         verbose=bool(verbose),
         export_dir=export_dir,
         seg_size=seg_size,
         thr=thr,
-        # legacy compat (some code still reads this name)
         min_component_px=comp_min_px,
-
-        # mode & per-mode thresholds
         force_mode=force_mode,
         thr_uni=thr_uni,
         thr_bi=thr_bi,
-
-        # morphology & components
         morph_close_open_close=morph_close_open_close,
         directional_close=directional_close,
         comp_min_px=comp_min_px,
         comp_min_rows=comp_min_rows,
         prune_iters=prune_iters,
-
-        # auto-thresholding & hysteresis
         auto_threshold=auto_threshold,
         auto_sweep=auto_sweep,
         auto_target_pct=auto_target_pct,
@@ -332,12 +271,8 @@ def _build_kymo_runner(cfg, log, verbose):
         hysteresis_enable=hysteresis_enable,
         hysteresis_low=hysteresis_low,
         hysteresis_high=hysteresis_high,
-
-        # fusion
         fuse_uni_into_bi=fuse_uni_into_bi,
         fuse_uni_weight=fuse_uni_weight,
-
-        # optional directional kernel hints (adapter may read them if implemented)
         dir_kv=dir_kv,
         dir_kh=dir_kh,
         diag_bridge=diag_bridge,
@@ -390,6 +325,9 @@ def main():
     # ensure sampling_rate present for period estimation
     sampling_rate = io_cfg.get('sampling_rate', 1.0)
     period_cfg.setdefault('sampling_rate', sampling_rate)
+
+    # features (optional knobs)
+    features_cfg = cfg.get('features', {}) or {}
 
     # heatmap params (for tables → images)
     heatmap_cfg = cfg.get('heatmap', {})
@@ -500,6 +438,7 @@ def main():
                 make_plot_spectrum=make_plot_spectrum,
                 dpi=dpi,
                 log=log,
+                features_cfg=features_cfg,
             )
             track_results.append(metrics)
             wave_results.extend(wave_rows)
@@ -511,14 +450,12 @@ def main():
     save_dataframe(df_tracks, args.output_csv)
     log.info(f"Track metrics saved to {args.output_csv}")
 
-    # write per-wave results
+    # write per-wave results (sorted)
     waves_csv = Path(args.output_csv).with_name(Path(args.output_csv).stem + "_waves.csv")
     df_waves = pd.DataFrame(wave_results)
 
     if not df_waves.empty:
-        # Coerce Track to numeric for a true numeric sort (handles "0"..."102", etc.)
         df_waves["Track"] = pd.to_numeric(df_waves["Track"], errors="coerce").astype("Int64")
-        # Stable sort: by Track, then Wave number, then Frame position 1 (optional)
         df_waves = df_waves.sort_values(
             ["Track", "Wave number", "Frame position 1"],
             kind="mergesort",
