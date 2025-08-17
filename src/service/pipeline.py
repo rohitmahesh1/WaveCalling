@@ -327,6 +327,8 @@ def iter_run_project(
 
     yield JobEvent("PROCESS", f"Processing {len(arr_paths)} track(s)", 0.60)
 
+    flush_every = 25  # write partial artifacts every 25 tracks
+
     for i, arr in enumerate(arr_paths, start=1):
         try:
             metrics, waves = _process_track(
@@ -352,6 +354,32 @@ def iter_run_project(
             f"Processed {i}/{len(arr_paths)}",
             0.60 + 0.25 * (i / max(1, len(arr_paths))),
         )
+
+        # Periodically flush partial artifacts for the UI
+        if (i % flush_every == 0) or (i == len(arr_paths)):
+            partial_tracks_csv = tracks_out / "metrics.partial.csv"
+            partial_waves_csv = tracks_out / "metrics_waves.partial.csv"
+
+            # tracks
+            df_tracks_partial = pd.DataFrame(track_results)
+            save_dataframe(df_tracks_partial, partial_tracks_csv)
+
+            # waves
+            df_waves_partial = pd.DataFrame(wave_results)
+            if not df_waves_partial.empty:
+                df_waves_partial = _sort_waves(df_waves_partial)
+            df_waves_partial.to_csv(partial_waves_csv, index=False, na_rep="NA")
+
+            # notify UI (SSE)
+            yield JobEvent(
+                "WRITE_PARTIAL",
+                f"Wrote partial artifacts at {i}/{len(arr_paths)}",
+                0.60 + 0.25 * (i / max(1, len(arr_paths))),
+                {
+                    "tracks_partial": str(partial_tracks_csv),
+                    "waves_partial": str(partial_waves_csv),
+                },
+            )
 
     # write CSVs (+ sort waves)
     tracks_csv = tracks_out / "metrics.csv"

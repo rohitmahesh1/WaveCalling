@@ -1,5 +1,8 @@
 # src/service/api.py
 from __future__ import annotations
+import os
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 import re
 import asyncio
 import json
@@ -199,37 +202,61 @@ def _artifact_urls(state: _RunState) -> Dict[str, str]:
 
 async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verbose: bool) -> None:
     """
-    Execute the pipeline in a worker thread and forward JobEvents to subscribers.
+    Execute the pipeline in a background thread and forward JobEvents to subscribers.
+    This prevents blocking the asyncio event loop so SSE can flush in real time.
     """
     state.status = "RUNNING"
+    loop = asyncio.get_running_loop()
+    bridge_q: asyncio.Queue[JobEvent] = asyncio.Queue()
 
-    def _progress(evt: JobEvent):
-        # Bridge sync callback into async fan-out
-        # Use asyncio.run_coroutine_threadsafe to schedule publish
-        loop = asyncio.get_event_loop()
-        asyncio.run_coroutine_threadsafe(state.publish(evt), loop)
+    def _runner_sync():
+        """Runs in a worker thread; pushes JobEvents back to the main loop via bridge_q."""
+        try:
+            for evt in iter_run_project(
+                input_dir=state.input_dir,
+                config_path=state.config_path,
+                output_dir=state.output_dir,
+                plots_out=state.plots_dir,
+                progress_cb=None,                 # events go via bridge_q
+                config_overrides=config_overrides,
+                verbose=verbose,
+            ):
+                asyncio.run_coroutine_threadsafe(bridge_q.put(evt), loop)
+        except Exception as e:
+            asyncio.run_coroutine_threadsafe(
+                bridge_q.put(JobEvent(phase="ERROR", message=str(e), progress=1.0)),
+                loop,
+            )
+        finally:
+            # ensure a terminal event even if the generator didn't yield one
+            asyncio.run_coroutine_threadsafe(
+                bridge_q.put(JobEvent(phase="DONE", message="Run finished", progress=1.0)),
+                loop,
+            )
+
+    # IMPORTANT: actually schedule the worker
+    worker_task = asyncio.create_task(asyncio.to_thread(_runner_sync))
 
     try:
-        # The generator itself yields JobEvents we can forward as well
-        for evt in iter_run_project(
-            input_dir=state.input_dir,
-            config_path=state.config_path,
-            output_dir=state.output_dir,
-            plots_out=state.plots_dir,
-            progress_cb=_progress,
-            config_overrides=config_overrides,
-            verbose=verbose,
-        ):
+        while True:
+            evt: JobEvent = await bridge_q.get()
+            # update run state on terminal phases
+            if evt.phase in ("ERROR", "DONE"):
+                state.status = evt.phase
+                if evt.phase == "ERROR":
+                    state.error = evt.message or "Unknown error"
             await state.publish(evt)
+            if evt.phase in ("ERROR", "DONE"):
+                break
 
-        state.status = "DONE"
+        # wait for the worker to finish cleanly
+        await worker_task
+
     except Exception as e:
         state.status = "ERROR"
         state.error = str(e)
-        # Emit an error event so clients are notified
         await state.publish(JobEvent(phase="ERROR", message=str(e), progress=1.0))
     finally:
-        # Emit a terminal DONE/ERROR event for clients that missed it
         terminal = "DONE" if state.status == "DONE" else "ERROR"
         await state.publish(JobEvent(phase=terminal, message="Run finished", progress=1.0))
 
@@ -342,4 +369,13 @@ async def stream_events(run_id: str):
 # Dev convenience: run with `python -m src.service.api`
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.service.api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "src.service.api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,  # keep for dev
+        # Only watch source & web; explicitly ignore output-heavy dirs
+        reload_includes=["src/*", "web/*", "configs/*"],
+        reload_excludes=["runs/*", "out/*", "data/generated_heatmaps/*"],
+    )
+

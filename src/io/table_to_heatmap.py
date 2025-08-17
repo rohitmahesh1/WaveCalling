@@ -1,3 +1,8 @@
+import os
+os.environ.setdefault("MPLBACKEND", "Agg")  # headless by default in server/threads
+import matplotlib
+matplotlib.use("Agg", force=True)
+
 from pathlib import Path
 import os
 import numpy as np
