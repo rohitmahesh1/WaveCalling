@@ -5,13 +5,23 @@ export type RunPhase =
   | "INIT" | "DISCOVER" | "TABLE2HEATMAP" | "KYMO" | "PROCESS" | "OVERLAY"
   | "WRITE" | "WRITE_PARTIAL";
 
+export interface JobEventExtra {
+  // Server may include these for partial/final artifacts and progress hints.
+  partial_index?: number;
+  tracks_partial?: string;
+  waves_partial?: string;
+  overlay_partial?: string;
+  total_tracks?: number;  // KYMO phase “total_tracks”
+  total?: number;         // resume hint “total”
+  // Allow future keys without breaking types:
+  [k: string]: unknown;
+}
+
 export interface JobEvent {
   phase: RunPhase;
   message: string;
   progress: number;                  // 0..1
-  // May contain server-rewritten URLs for partial/final artifacts
-  // or other small payloads for the UI.
-  extra?: Record<string, unknown>;
+  extra?: JobEventExtra;             // typed-but-flexible
 }
 
 export interface RunInfo {
@@ -31,7 +41,12 @@ export interface ArtifactMap {
   tracks_csv?: string;
   waves_csv?: string;
   overlay_json?: string;
+  overlay_json_partial?: string;
   manifest_json?: string;
+  run_json?: string;
+  events_ndjson?: string;
+  progress_json?: string;
+  base_image?: string;
   plots_dir?: string;
   output_dir?: string;
   // allow future keys without breaking types
@@ -69,8 +84,20 @@ export interface OverlayTrack {
   metrics: OverlayTrackMetrics;
 }
 
-
 export interface OverlayPayload {
   version: number;
   tracks: OverlayTrack[];
 }
+
+/** Progress endpoint shape */
+export interface ProgressResponse {
+  totalTracks: number | null;
+  processedCount: number;
+  skippedCount?: number | null;
+  lastUpdatedAt?: string | null;
+  source: "file" | "synthesized";
+}
+
+/** Tracks listing (for download / per-track actions) */
+export type TracksListItem = { id: string; url: string };
+export type TracksListResponse = { count: number; tracks: TracksListItem[] };
