@@ -1,20 +1,25 @@
-import React, { createContext, useContext, useMemo } from "react";
+import * as React from "react";
 
-type Ctx = { apiBase: string };
-const ApiCtx = createContext<Ctx | null>(null);
+// Default to same-origin (useful when UI is served by FastAPI in prod)
+const sameOrigin = typeof window !== "undefined" ? window.location.origin : "http://localhost:8000";
 
-export const ApiProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
-  // Prefer env; fallback to current origin (strip /ui if present)
-  const env = import.meta.env.VITE_API_URL as string | undefined;
-  const fromOrigin = window.location.origin.replace(/\/$/, "");
-  const apiBase = (env && env.trim()) || fromOrigin;
+// Prefer build-time Vite env, else fallback
+const DEFAULT_API_BASE =
+  (import.meta as any)?.env?.VITE_API_URL || sameOrigin;
 
-  const value = useMemo(() => ({ apiBase }), [apiBase]);
-  return <ApiCtx.Provider value={value}>{children}</ApiCtx.Provider>;
-};
+const ApiContext = React.createContext<string>(DEFAULT_API_BASE);
+
+export function ApiProvider({
+  base,
+  children,
+}: {
+  base?: string;
+  children: React.ReactNode;
+}) {
+  const value = base ?? DEFAULT_API_BASE;
+  return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>;
+}
 
 export function useApiBase() {
-  const v = useContext(ApiCtx);
-  if (!v) throw new Error("ApiProvider missing");
-  return v.apiBase;
+  return React.useContext(ApiContext);
 }

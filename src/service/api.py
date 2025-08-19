@@ -95,7 +95,7 @@ class _RunState:
         return RunInfo(
             run_id=self.run_id,
             name=self.name,
-            created_at=self.created_at.isoformat() + "Z",
+            created_at=self.created_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             status=self.status,
             error=self.error,
             input_dir=str(self.input_dir),

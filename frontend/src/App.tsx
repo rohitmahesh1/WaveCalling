@@ -1,6 +1,6 @@
 import { Link, Route, Routes, Navigate, useLocation } from "react-router-dom";
 import UploadRun from "@/pages/UploadRun";
-import RunsList from "@/pages/RunsList";
+import RunsList from "@/pages/RunLists";
 import Viewer from "@/pages/Viewer";
 
 export default function App() {
