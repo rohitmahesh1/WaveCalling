@@ -1,8 +1,9 @@
 logging:
   level: INFO  # DEBUG, INFO, WARNING, ERROR
+  jsonl_events: true            # NEW: write events.ndjson for SSE replay
 
 io:
-  sampling_rate: 5.0
+  sampling_rate: &sr 5.0        # anchor for reuse
   image_globs: ["*.png", "*.jpg", "*.jpeg"]
   track_glob: "*.npy"
   table_globs: ["*.csv", "*.tsv", "*.xls", "*.xlsx"]
@@ -26,7 +27,7 @@ peaks:
   distance: 8
 
 period:
-  sampling_rate: 5.0
+  sampling_rate: *sr            # use the same value as io.sampling_rate
   min_freq: 0.02
   max_freq: 2.0
 
@@ -37,6 +38,10 @@ viz:
     spectrum: true
   summary:
     histograms: true
+  wave_windows:                # NEW: tame explosion of tiny files
+    save: true                 # save per-peak window PNGs
+    max_per_track: 50          # cap count per track
+    stride: 1                  # take every Nth window (1 = keep all)
   hist_bins: 20
   dpi: 180
 
@@ -48,13 +53,30 @@ features:
     prominence_min_px: 1.0
 
 # ----------------------------------------------------
+# Service / pipeline controls (NEW)
+# ----------------------------------------------------
+service:
+  partial_every_tracks: 250      # write tracks.partial.json every N tracks
+  write_progress_every_secs: 10  # update progress.json cadence
+  resume:
+    enabled: true
+    marker_dir: "output/processed"   # per-track .done markers
+    progress_file: "progress.json"   # global progress snapshot
+    safe_skip: true                  # verify outputs before skipping
+  retention:
+    enabled: false                   # set true to enable auto-prune
+    keep_last_runs: 20
+    max_run_age_days: null           # e.g., 14 to age out old runs
+  artifacts:
+    write_run_json: true             # persist run.json metadata
+    write_events_ndjson: true        # append events.ndjson for replay
+
+# ----------------------------------------------------
 # KymoButler pipeline configuration
 # ----------------------------------------------------
 kymo:
-  # Choose backend: "onnx" (Python/ONNXRuntime) or "wolfram" (Mathematica scripts)
   backend: onnx
 
-  # ---------------- ONNX backend options ----------------
   onnx:
     # Model & classification/seg behavior
     export_dir: null          # null => auto-discover export/
@@ -93,12 +115,12 @@ kymo:
       min_rows: 5
 
     skeleton:
-      method: thin             # "thin" | "zhangsuen" (adapter currently uses 'thin')
-      prune_iters: 0           # WL Pruning[..., k]
-      keep_ratio: 0.60         # adaptive corridor keep ratio (0..1)
-      keep_min_px: 2000        # absolute min pixels to keep
-      prob_floor_min: 0.06     # clamp p10 floor lower bound (NEW: adapter honors)
-      prob_floor_max: 0.10     # clamp p10 floor upper bound (NEW: adapter honors)
+      method: thin             # "thin" | "zhangsuen"
+      prune_iters: 0
+      keep_ratio: 0.60
+      keep_min_px: 2000
+      prob_floor_min: 0.06     # adapter honors
+      prob_floor_max: 0.10     # adapter honors
 
     # Tracking & post-processing
     tracking:
@@ -109,7 +131,7 @@ kymo:
     postproc:
       extend_rows: 22
       dx_win: 4
-      prob_min: 0.11          # mapped to refine_prob_min in adapter
+      prob_min: 0.11
       max_gap_rows: 13
       max_dx: 6
       prob_bridge_min: 0.11
@@ -121,8 +143,7 @@ kymo:
         dx_tol: 2.5
 
     debug:
-      save_debug_images: true  # NEW: adapter now gates file writes on this
+      save_debug_images: true  # adapter gates file writes on this
 
-  # ---------------- Wolfram backend options ----------------
   wolfram:
     scripts_dir: kymobutler_scripts

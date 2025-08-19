@@ -1,6 +1,12 @@
 # src/service/api.py
 from __future__ import annotations
+from collections import deque
+from contextlib import asynccontextmanager
 import os
+
+import aiofiles
+
+from ..utils import load_config
 # Ensure headless plotting in worker threads (must be set BEFORE any Matplotlib import anywhere)
 os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -14,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,17 +38,84 @@ RUNS_ROOT = APP_ROOT / "runs"
 RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-# ---- FastAPI app ----
-app = FastAPI(title="WaveCalling API", version="0.1.0")
+# -----------------------
+# Persistence helpers (NEW)
+# -----------------------
+def _run_dir(run_id: str) -> Path:
+    return RUNS_ROOT / run_id
 
-# (optional) CORS so the React app can talk to this API during dev
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],           # tighten in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _events_path(run_id: str) -> Path:
+    return _run_dir(run_id) / "events.ndjson"
+
+def _run_json_path(run_id: str) -> Path:
+    return _run_dir(run_id) / "run.json"
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(path)
+
+def _append_event(run_id: str, evt: JobEvent) -> None:
+    """Append an event to NDJSON log (best-effort; small writes)."""
+    p = _events_path(run_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(asdict(evt)) + "\n")
+
+def _load_run_json(path: Path) -> Optional[dict]:
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- startup: load persisted runs from disk ----
+    for d in RUNS_ROOT.iterdir():
+        if not d.is_dir():
+            continue
+        rj = _run_json_path(d.name)
+        meta = _load_run_json(rj) or {}
+        if not meta:
+            continue
+        run_id = meta.get("run_id") or d.name
+        name = meta.get("name") or f"run-{run_id}"
+        st = _RunState(
+            run_id=run_id,
+            name=name,
+            base_dir=d,
+            config_path=Path(meta.get("config_path", d / "config.yaml")),
+            created_at_iso=meta.get("created_at"),
+            status=meta.get("status", "DONE"),
+            error=meta.get("error"),
+        )
+        _RUNS[run_id] = st
+
+    # hand over control to the app
+    yield
+
+    # ---- shutdown cleanup (safe no-op if unused) ----
+    for st in list(_RUNS.values()):
+        if st.status in ("QUEUED", "RUNNING"):
+            st.cancel_event.set()
+            if st.worker_task:
+                try:
+                    await st.worker_task
+                except Exception:
+                    pass
+
+
+# ---- FastAPI app ----
+app = FastAPI(title="WaveCalling API", version="0.2.0", lifespan=lifespan)
+
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
+app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Expose the runs directory for downloading artifacts (CSV/plots/overlay)
 app.mount("/runs", StaticFiles(directory=str(RUNS_ROOT)), name="runs")
@@ -67,8 +140,12 @@ class RunInfo(BaseModel):
 
 
 class _RunState:
-    """Internal state for each run: dirs, subscribers, and status."""
-    def __init__(self, run_id: str, name: str, base_dir: Path, config_path: Path):
+    """
+    Internal state for each run: dirs, subscribers, status, and persistence.
+    Persists run.json and events.ndjson so UI can list/replay after refresh.
+    """
+    def __init__(self, run_id: str, name: str, base_dir: Path, config_path: Path,
+                 created_at_iso: Optional[str] = None, status: str = "QUEUED", error: Optional[str] = None):
         self.run_id = run_id
         self.name = name
         self.base_dir = base_dir
@@ -81,9 +158,12 @@ class _RunState:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
-        self.created_at = datetime.now(timezone.utc)
-        self.status = "QUEUED"
-        self.error: Optional[str] = None
+        self.created_at = (
+            datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+            if created_at_iso else datetime.now(timezone.utc)
+        )
+        self.status = status
+        self.error: Optional[str] = error
 
         self.cancel_event: asyncio.Event = asyncio.Event()
         self.worker_task: Optional[asyncio.Task] = None
@@ -91,11 +171,37 @@ class _RunState:
         self._subscribers: List[asyncio.Queue] = []
         self._sub_lock = asyncio.Lock()
 
+        # Persist initial snapshot
+        self._persist_run_json()
+
+    # ---------- persistence ----------
+    def _persist_run_json(self) -> None:
+        payload = {
+            "run_id": self.run_id,
+            "name": self.name,
+            "created_at": self.created_at.isoformat().replace("+00:00", "Z"),
+            "status": self.status,
+            "error": self.error,
+            "input_dir": str(self.input_dir),
+            "output_dir": str(self.output_dir),
+            "plots_dir": str(self.plots_dir),
+            "config_path": str(self.config_path),
+        }
+        _write_json(_run_json_path(self.run_id), payload)
+
+    def _persist_event(self, evt: JobEvent) -> None:
+        try:
+            _append_event(self.run_id, evt)
+        except Exception:
+            # best-effort; don't crash on fs hiccups
+            pass
+
+    # ---------- public API ----------
     def info(self) -> RunInfo:
         return RunInfo(
             run_id=self.run_id,
             name=self.name,
-            created_at=self.created_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            created_at=self.created_at.isoformat().replace("+00:00", "Z"),
             status=self.status,
             error=self.error,
             input_dir=str(self.input_dir),
@@ -116,16 +222,23 @@ class _RunState:
                 self._subscribers.remove(q)
 
     async def publish(self, evt: JobEvent) -> None:
-        # fan-out without blocking
+        # persist then fan-out
+        self._persist_event(evt)
         async with self._sub_lock:
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(evt)
                 except asyncio.QueueFull:
-                    # drop if back-pressured
                     pass
 
+    def set_status(self, status: str, error: Optional[str] = None) -> None:
+        self.status = status
+        if error is not None:
+            self.error = error
+        self._persist_run_json()
 
+
+# Global registry (in-memory)
 _RUNS: Dict[str, _RunState] = {}
 
 
@@ -136,7 +249,6 @@ class CreateRunResponse(BaseModel):
     run_id: str
     status: str
     info: RunInfo
-
 
 class RunStatusResponse(BaseModel):
     info: RunInfo
@@ -151,16 +263,9 @@ class RunStatusResponse(BaseModel):
 # -----------------------
 
 async def _save_uploads(files, out_dir: Path) -> list[Path]:
-    """
-    Save FastAPI UploadFile objects into out_dir.
-    - Ensures the directory exists.
-    - Sanitizes filenames.
-    - Streams in chunks to avoid large memory spikes.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def _safe_name(name: str) -> str:
-        # Keep basename only, strip directories, and allow [A-Za-z0-9._-]
         base = Path(name or "upload.bin").name
         return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
 
@@ -169,47 +274,64 @@ async def _save_uploads(files, out_dir: Path) -> list[Path]:
         fname = _safe_name(getattr(uf, "filename", "") or "upload.bin")
         out_path = out_dir / fname
 
-        # Stream to disk
-        with out_path.open("wb") as w:
+        async with aiofiles.open(out_path, "wb") as w:
             while True:
                 chunk = await uf.read(64 * 1024)
                 if not chunk:
                     break
-                w.write(chunk)
+                await w.write(chunk)
         await uf.close()
         saved_paths.append(out_path)
 
     return saved_paths
 
-def _artifact_urls(state: _RunState) -> Dict[str, str]:
+def _resolve_progress_paths(st: _RunState) -> tuple[Path, list[Path]]:
     """
-    Produce best-effort artifact URLs. Files may not exist yet while the run
-    is still in progress.
+    Resolve progress.json and candidate marker dirs based on the run's config.
+    We tolerate both 'processed' and 'output/processed' to be robust.
     """
-    base = f"/runs/{state.run_id}"
-    # known outputs
-    tracks_csv = Path(base) / "output" / "metrics.csv"
-    waves_csv = Path(base) / "output" / "metrics_waves.csv"
-    overlay_json = Path(base) / "output" / "overlay" / "tracks.json"
-    manifest_json = Path(base) / "output" / "manifest.json"
-    plots_dir = Path(base) / "plots"
-    base_image = Path(base) / "output" / "base.png"
+    cfg = load_config(st.config_path)
+    svc = (cfg.get("service") or {})
+    resume = (svc.get("resume") or {})
+    progress_rel = resume.get("progress_file", "progress.json")
+    marker_rel = resume.get("marker_dir", "processed")
 
+    out = Path(st.output_dir)
+
+    # Primary resolved paths
+    progress_path = (out / progress_rel).resolve()
+    marker_dir = (out / marker_rel).resolve()
+
+    # Back-compat probe (in case config mistakenly set "output/processed")
+    alt_marker_dir = (out / "output" / "processed").resolve()
+    markers = [p for p in {marker_dir, alt_marker_dir} if p.exists()]
+
+    # If neither exists yet, still return both so caller can try them
+    if not markers:
+        markers = [marker_dir, alt_marker_dir]
+
+    return progress_path, markers
+
+def _artifact_urls(state: _RunState) -> Dict[str, str]:
+    base = f"/runs/{state.run_id}"
     return {
-        "tracks_csv": str(tracks_csv),
-        "waves_csv": str(waves_csv),
-        "overlay_json": str(overlay_json),
-        "manifest_json": str(manifest_json),
-        "plots_dir": str(plots_dir),
-        "output_dir": str(Path(base) / "output"),
-        "base_image": str(base_image),
+        "tracks_csv": f"{base}/output/metrics.csv",
+        "waves_csv": f"{base}/output/metrics_waves.csv",
+        "overlay_json": f"{base}/output/overlay/tracks.json",
+        "overlay_json_partial": f"{base}/output/overlay/tracks.partial.json",
+        "run_json": f"{base}/run.json",
+        "events_ndjson": f"{base}/events.ndjson",
+        "progress_json": f"{base}/output/progress.json",  # may not exist yet
+        "plots_dir": f"{base}/plots",
+        "output_dir": f"{base}/output",
+        "base_image": f"{base}/output/base.png",
     }
 
-
 async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verbose: bool) -> None:
-    state.status = "RUNNING"
+    state.set_status("RUNNING")
     loop = asyncio.get_running_loop()
     bridge_q: asyncio.Queue[JobEvent] = asyncio.Queue()
+    terminal_seen = False  # add
 
     def _runner_sync():
         got_terminal = False
@@ -219,10 +341,9 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
                 config_path=state.config_path,
                 output_dir=state.output_dir,
                 plots_out=state.plots_dir,
-                progress_cb=None,  # events go via bridge_q
+                progress_cb=None,
                 config_overrides=config_overrides,
                 verbose=verbose,
-                # PASS CANCELLATION HERE
                 cancel_cb=lambda: state.cancel_event.is_set(),
             ):
                 if evt.phase in ("DONE", "ERROR", "CANCELLED"):
@@ -240,30 +361,51 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
                     loop,
                 )
 
-    # Track worker so we can await it on shutdown or after cancel
     state.worker_task = asyncio.create_task(asyncio.to_thread(_runner_sync))
 
     try:
         while True:
             evt: JobEvent = await bridge_q.get()
             if evt.phase in ("ERROR", "DONE", "CANCELLED"):
-                state.status = evt.phase
-                if evt.phase == "ERROR":
-                    state.error = evt.message or "Unknown error"
+                terminal_seen = True  # add
+                state.set_status(evt.phase, error=(evt.message if evt.phase == "ERROR" else None))
             await state.publish(evt)
             if evt.phase in ("ERROR", "DONE", "CANCELLED"):
                 break
 
-        # wait for the worker to finish cleanly
-        await state.worker_task
+        if state.worker_task:
+            await state.worker_task
 
     except Exception as e:
-        state.status = "ERROR"
-        state.error = str(e)
+        state.set_status("ERROR", error=str(e))
         await state.publish(JobEvent(phase="ERROR", message=str(e), progress=1.0))
     finally:
-        terminal = state.status if state.status in ("DONE", "ERROR", "CANCELLED") else "ERROR"
-        await state.publish(JobEvent(phase=terminal, message="Run finished", progress=1.0))
+        if not terminal_seen:  # only synthesize if nothing terminal got through
+            terminal = state.status if state.status in ("DONE", "ERROR", "CANCELLED") else "ERROR"
+            await state.publish(JobEvent(phase=terminal, message="Run finished", progress=1.0))
+    
+def _synthesize_info_from_dir(d: Path) -> Optional[RunInfo]:
+    rj = _run_json_path(d.name)
+    meta = _load_run_json(rj) or {}
+    if not meta and not d.is_dir():
+        return None
+    created = meta.get("created_at") or datetime.fromtimestamp(
+        d.stat().st_mtime, tz=timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+
+    run_id = meta.get("run_id") or d.name
+    name = meta.get("name") or f"run-{run_id}"
+    status = meta.get("status") or "DONE"
+    input_dir = meta.get("input_dir") or str(d / "input")
+    output_dir = meta.get("output_dir") or str(d / "output")
+    plots_dir = meta.get("plots_dir") or str(d / "plots")
+    config_path = meta.get("config_path") or str(d / "config.yaml")
+
+    return RunInfo(
+        run_id=run_id, name=name, created_at=created, status=status,
+        error=meta.get("error"), input_dir=input_dir, output_dir=output_dir,
+        plots_dir=plots_dir, config_path=config_path
+    )
 
 
 # -----------------------
@@ -274,20 +416,18 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
 async def create_run(
     files: List[UploadFile] = File(..., description="One or more CSV/XLS/PNG/JPG"),
     run_name: Optional[str] = Form(None),
-    config_overrides: Optional[str] = Form(
-        None, description="JSON string with partial overrides to default YAML"
-    ),
+    config_overrides: Optional[str] = Form(None, description="JSON string with partial overrides to default YAML"),
     verbose: bool = Form(False),
 ):
     """
     Create a new run:
       - Saves uploads under runs/<run_id>/input
-      - Copies/uses default config YAML (plus optional overrides)
+      - Copies default config next to the run (traceability)
       - Starts the pipeline in background
       - Returns run_id immediately
     """
     run_id = uuid.uuid4().hex[:10]
-    base_dir = RUNS_ROOT / run_id
+    base_dir = _run_dir(run_id)
     (base_dir / "input").mkdir(parents=True, exist_ok=True)
 
     # Save inputs
@@ -295,13 +435,13 @@ async def create_run(
     if not saved:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    # Resolve config (copy default next to run for traceability)
+    # Copy config
     if not DEFAULT_CONFIG.exists():
         raise HTTPException(status_code=500, detail=f"Default config not found: {DEFAULT_CONFIG}")
     config_path = base_dir / "config.yaml"
     shutil.copyfile(DEFAULT_CONFIG, config_path)
 
-    # Parse overrides if provided
+    # Parse overrides (stored only in memory; the generator consumes them)
     overrides: Optional[dict] = None
     if config_overrides:
         try:
@@ -309,8 +449,15 @@ async def create_run(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid config_overrides JSON: {e}")
 
-    # Create state & registry entry
-    state = _RunState(run_id=run_id, name=run_name or f"run-{run_id}", base_dir=base_dir, config_path=config_path)
+    # Create state, persist run.json
+    state = _RunState(
+        run_id=run_id,
+        name=run_name or f"run-{run_id}",
+        base_dir=base_dir,
+        config_path=config_path,
+        created_at_iso=_iso_now(),
+        status="QUEUED",
+    )
     _RUNS[run_id] = state
 
     # Kick off worker task (async)
@@ -321,8 +468,21 @@ async def create_run(
 
 @app.get("/api/runs", response_model=List[RunInfo])
 async def list_runs():
-    """List recent runs (in-memory registry)."""
-    return [st.info() for st in _RUNS.values()]
+    # disk scan
+    disk: dict[str, RunInfo] = {}
+    for d in RUNS_ROOT.iterdir():
+        if d.is_dir():
+            info = _synthesize_info_from_dir(d)
+            if info:
+                disk[info.run_id] = info
+
+    # live overrides (authoritative for RUNNING/QUEUED)
+    for run_id, st in _RUNS.items():
+        disk[run_id] = st.info()
+
+    infos = list(disk.values())
+    infos.sort(key=lambda r: r.created_at, reverse=True)
+    return infos
 
 
 @app.get("/api/runs/{run_id}", response_model=RunStatusResponse)
@@ -344,11 +504,11 @@ async def get_run_artifacts(run_id: str):
 
 
 @app.get("/api/runs/{run_id}/events")
-async def stream_events(run_id: str):
+async def stream_events(run_id: str, replay: int = Query(0, description="1 = replay historical events first")):
     """
     Server-Sent Events stream of JobEvent for the given run.
     Browser usage:
-      const es = new EventSource(`/api/runs/${runId}/events`);
+      const es = new EventSource(`/api/runs/${runId}/events?replay=1`);
       es.onmessage = (e) => { const evt = JSON.parse(e.data); ... }
     """
     st = _RUNS.get(run_id)
@@ -381,7 +541,7 @@ async def stream_events(run_id: str):
                 pass
         except Exception:
             pass
-        return p  # if already URL-like or unknown root
+        return p  # unknown root or already a URL
 
     def _rewrite_payload(payload: dict) -> dict:
         extra = payload.get("extra")
@@ -399,19 +559,39 @@ async def stream_events(run_id: str):
 
     async def gen():
         try:
-            # push an initial status snapshot to new subscribers
             yield {"event": "message", "data": json.dumps({"phase": st.status, "message": "subscribed", "progress": 0.0})}
+            if replay:
+                nd = _events_path(st.run_id)
+                if nd.exists():
+                    try:
+                        lines_iter = open(nd)
+                        if replay > 1:
+                            lines_iter = deque(lines_iter, maxlen=replay)
+                        for line in lines_iter:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                payload = json.loads(line)
+                                payload = _rewrite_payload(payload)
+                                yield {"event": "message", "data": json.dumps(payload)}
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+            # Now live events
             while True:
                 evt: JobEvent = await q.get()
                 payload = asdict(evt)
                 payload = _rewrite_payload(payload)
                 yield {"event": "message", "data": json.dumps(payload)}
-                if evt.phase in ("DONE", "ERROR"):
+                if evt.phase in ("DONE", "ERROR", "CANCELLED"):
                     break
         finally:
             await st.remove_subscriber(q)
 
-    # ping keeps the connection alive through proxies (seconds)
+    # keep-alive ping (seconds)
     return EventSourceResponse(gen(), ping=15)
 
 
@@ -421,7 +601,6 @@ async def get_overlay(run_id: str):
     st = _RUNS.get(run_id)
     if not st:
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    # Prefer final file, fall back to partial if present
     final = st.output_dir / "overlay" / "tracks.json"
     partial = st.output_dir / "overlay" / "tracks.partial.json"
     path = final if final.exists() else partial
@@ -459,12 +638,13 @@ async def list_wave_windows(run_id: str, track: Optional[str] = None):
     urls = [f"/runs/{st.run_id}/plots/{track}/peak_windows/{p.name}" for p in files]
     return JSONResponse({"images": urls})
 
+
 @app.post("/api/runs/{run_id}/cancel")
 async def cancel_run(run_id: str):
     """
-    Signal a running job to stop early. The pipeline will:
-      - Finish the current micro-step,
-      - Write partial artifacts (.partial.csv / tracks.partial.json),
+    Signal a running job to stop early. The pipeline should:
+      - Check cancel_cb() at safe points,
+      - Write partial artifacts,
       - Emit a CANCELLED terminal event.
     """
     st = _RUNS.get(run_id)
@@ -473,9 +653,127 @@ async def cancel_run(run_id: str):
     if st.status not in ("QUEUED", "RUNNING"):
         return {"run_id": run_id, "status": st.status, "message": "Run is not active"}
 
-    # flip the flag; the generator will exit soon
     st.cancel_event.set()
     return {"run_id": run_id, "status": "CANCEL_REQUESTED"}
+
+
+@app.post("/api/runs/{run_id}/resume")
+async def resume_run(run_id: str, verbose: bool = Form(False)):
+    """
+    Basic resume: re-run the pipeline for this run_id using existing inputs/config.
+    (Your pipeline already prefers existing .npy → will skip Kymo phase.)
+    For true step-level resume, add checkpoint support in the pipeline and plumb it here.
+    """
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+
+    if st.status == "RUNNING":
+        return {"run_id": run_id, "status": st.status, "message": "Run is already running"}
+
+    # Clear cancel flag if previously set
+    if st.cancel_event.is_set():
+        st.cancel_event.clear()
+
+    # Start worker again (same run id, artifacts will overwrite/append)
+    asyncio.create_task(_run_pipeline(st, config_overrides=None, verbose=verbose))
+    return {"run_id": run_id, "status": "RUNNING"}
+
+@app.get("/api/runs/{run_id}/progress")
+async def get_progress(run_id: str):
+    """
+    Return pipeline progress:
+      {
+        "totalTracks": int|null,
+        "processedCount": int,
+        "skippedCount": int|null,
+        "lastUpdatedAt": iso8601|null,
+        "source": "file" | "synthesized"
+      }
+    """
+    st = _RUNS.get(run_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+
+    progress_path, marker_dirs = _resolve_progress_paths(st)
+
+    # 1) Preferred: read progress.json
+    if progress_path.exists():
+        try:
+            with progress_path.open() as f:
+                data = json.load(f)
+            # add a hint for clients
+            data.setdefault("source", "file")
+            return JSONResponse(data)
+        except Exception as e:
+            # fall through to synthesized
+            pass
+
+    # 2) Synthesized fallback
+    processed_count = 0
+    for md in marker_dirs:
+        if md.exists():
+            try:
+                processed_count = max(processed_count, sum(1 for _ in md.glob("*.done")))
+            except Exception:
+                continue
+
+    total_tracks: Optional[int] = None
+    skipped_count: Optional[int] = None
+    last_updated: Optional[str] = None
+
+    # Try to infer totals from events.ndjson
+    nd = _events_path(run_id)
+    if nd.exists():
+        try:
+            max_total_tracks = 0
+            with nd.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        # resume event has explicit total
+                        if isinstance(evt.get("extra"), dict):
+                            extra = evt["extra"]
+                            if "total" in extra and isinstance(extra["total"], int):
+                                max_total_tracks = max(max_total_tracks, int(extra["total"]))
+                            if "total_tracks" in extra and isinstance(extra["total_tracks"], int):
+                                # kymo phase emits cumulative discovered tracks; take max
+                                max_total_tracks = max(max_total_tracks, int(extra["total_tracks"]))
+                        # capture last updated timestamp-ish from event order
+                        last_updated = evt.get("ts") or last_updated
+                    except Exception:
+                        continue
+            total_tracks = max_total_tracks or None
+        except Exception:
+            pass
+
+    payload = {
+        "totalTracks": total_tracks if total_tracks is not None else (processed_count if processed_count else None),
+        "processedCount": int(processed_count),
+        "skippedCount": skipped_count,   # unknown without progress.json; client should treat null as "n/a"
+        "lastUpdatedAt": last_updated,   # may be null; progress.json is authoritative when present
+        "source": "synthesized",
+    }
+    return JSONResponse(payload)
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "version": app.version}
+
+@app.delete("/api/runs/{run_id}")
+async def delete_run(run_id: str):
+    st = _RUNS.get(run_id)
+    if st and st.status in ("QUEUED", "RUNNING"):
+        raise HTTPException(status_code=409, detail="Cannot delete an active run")
+    try:
+        shutil.rmtree(_run_dir(run_id))
+    except FileNotFoundError:
+        pass
+    _RUNS.pop(run_id, None)
+    return {"deleted": run_id}
 
 
 # Dev convenience: run with `python -m src.service.api`
