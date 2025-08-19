@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import time                   # NEW
-import inspect                # NEW
+import time
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Set, Dict  # NEW
+from typing import Callable, Iterator, List, Optional, Set, Dict
 
 import numpy as np
 import pandas as pd
@@ -145,7 +145,7 @@ def _build_overlay_json(
 
 
 # -----------------------
-# Core run (generator) — supports cancellation + partial writes + resume (NEW)
+# Core run (generator) — supports cancellation + partial writes + resume
 # -----------------------
 
 def iter_run_project(
@@ -335,7 +335,7 @@ def iter_run_project(
         yield JobEvent("ERROR", "No track arrays (.npy) found after processing", 1.0)
         return
 
-    # -------- resume filtering (NEW) --------
+    # -------- resume filtering --------
     total_tracks = len(arr_paths_all)
     arr_index: Dict[Path, int] = {p: i for i, p in enumerate(arr_paths_all)}
     processed_indices: Set[int] = set()
@@ -371,7 +371,7 @@ def iter_run_project(
     summary_cfg = viz_cfg.get("summary", {}) or {}
     make_summary_hists = bool(summary_cfg.get("histograms", True))
     hist_bins = int(viz_cfg.get("hist_bins", 20))
-    wave_win_cfg = (viz_cfg.get("wave_windows") or {})  # NEW
+    wave_win_cfg = (viz_cfg.get("wave_windows") or {})
 
     detrend_cfg = cfg.get("detrend", {}) or {}
     peaks_cfg = cfg.get("peaks", {}) or {}
@@ -385,7 +385,7 @@ def iter_run_project(
     track_results: List[dict] = []
     wave_results: List[dict] = []
 
-    # conditionally pass new wave-window limits if process_track supports them
+    # Conditionally pass new wave-window limits if process_track supports them
     pt_params = set(inspect.signature(_process_track).parameters.keys())
     extra_pt_kwargs = {}
     if "save_wave_windows" in pt_params:
@@ -456,7 +456,7 @@ def iter_run_project(
                 make_plot_spectrum=make_plot_spectrum,
                 dpi=int(viz_cfg.get("dpi", 180)),
                 log=get_logger("pipeline.process"),
-                **extra_pt_kwargs,   # NEW (safe; only if supported)
+                **extra_pt_kwargs,
             )
             track_results.append(metrics)
             wave_results.extend(waves)
@@ -550,7 +550,7 @@ def iter_run_project(
             "skipped_count": int(skipped_count),
             "marker_dir": str(marker_dir),
             "progress_file": str(progress_file),
-        },  # NEW
+        },
     }
     manifest_json = tracks_out / "manifest.json"
     with open(manifest_json, "w") as f:
@@ -569,3 +569,4 @@ def iter_run_project(
     _emit(progress_cb, evt); yield evt
 
     yield JobEvent("DONE", "Pipeline complete", 1.0)
+

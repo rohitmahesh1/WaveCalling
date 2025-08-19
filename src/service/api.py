@@ -18,7 +18,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +39,7 @@ RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 # -----------------------
-# Persistence helpers (NEW)
+# Persistence helpers
 # -----------------------
 def _run_dir(run_id: str) -> Path:
     return RUNS_ROOT / run_id
@@ -73,6 +73,7 @@ def _load_run_json(path: Path) -> Optional[dict]:
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -285,11 +286,8 @@ async def _save_uploads(files, out_dir: Path) -> list[Path]:
 
     return saved_paths
 
-def _resolve_progress_paths(st: _RunState) -> tuple[Path, list[Path]]:
-    """
-    Resolve progress.json and candidate marker dirs based on the run's config.
-    We tolerate both 'processed' and 'output/processed' to be robust.
-    """
+def _resolve_progress_paths_for_state(st: _RunState) -> Tuple[Path, List[Path]]:
+    """Resolve progress.json + candidate marker dirs based on a live state's config."""
     cfg = load_config(st.config_path)
     svc = (cfg.get("service") or {})
     resume = (svc.get("resume") or {})
@@ -297,22 +295,34 @@ def _resolve_progress_paths(st: _RunState) -> tuple[Path, list[Path]]:
     marker_rel = resume.get("marker_dir", "processed")
 
     out = Path(st.output_dir)
-
-    # Primary resolved paths
     progress_path = (out / progress_rel).resolve()
     marker_dir = (out / marker_rel).resolve()
-
-    # Back-compat probe (in case config mistakenly set "output/processed")
-    alt_marker_dir = (out / "output" / "processed").resolve()
-    markers = [p for p in {marker_dir, alt_marker_dir} if p.exists()]
-
-    # If neither exists yet, still return both so caller can try them
-    if not markers:
-        markers = [marker_dir, alt_marker_dir]
-
+    alt_marker_dir = (out / "output" / "processed").resolve()  # back-compat
+    markers = [p for p in {marker_dir, alt_marker_dir} if p.exists()] or [marker_dir, alt_marker_dir]
     return progress_path, markers
 
-def _artifact_urls(state: _RunState) -> Dict[str, str]:
+def _resolve_progress_paths_for_disk(run_id: str) -> Tuple[Path, List[Path]]:
+    """Resolve progress paths when the run isn't in memory (restart scenario)."""
+    base = _run_dir(run_id)
+    cfg_path = base / "config.yaml"
+    out = base / "output"
+    try:
+        cfg = load_config(cfg_path)
+        svc = (cfg.get("service") or {})
+        resume = (svc.get("resume") or {})
+        progress_rel = resume.get("progress_file", "progress.json")
+        marker_rel = resume.get("marker_dir", "processed")
+    except Exception:
+        progress_rel = "progress.json"
+        marker_rel = "processed"
+
+    progress_path = (out / progress_rel).resolve()
+    marker_dir = (out / marker_rel).resolve()
+    alt_marker_dir = (out / "output" / "processed").resolve()
+    markers = [p for p in {marker_dir, alt_marker_dir} if p.exists()] or [marker_dir, alt_marker_dir]
+    return progress_path, markers
+
+def _artifact_urls_by_state(state: _RunState) -> Dict[str, str]:
     base = f"/runs/{state.run_id}"
     return {
         "tracks_csv": f"{base}/output/metrics.csv",
@@ -321,7 +331,22 @@ def _artifact_urls(state: _RunState) -> Dict[str, str]:
         "overlay_json_partial": f"{base}/output/overlay/tracks.partial.json",
         "run_json": f"{base}/run.json",
         "events_ndjson": f"{base}/events.ndjson",
-        "progress_json": f"{base}/output/progress.json",  # may not exist yet
+        "progress_json": f"{base}/output/progress.json",
+        "plots_dir": f"{base}/plots",
+        "output_dir": f"{base}/output",
+        "base_image": f"{base}/output/base.png",
+    }
+
+def _artifact_urls_by_id(run_id: str) -> Dict[str, str]:
+    base = f"/runs/{run_id}"
+    return {
+        "tracks_csv": f"{base}/output/metrics.csv",
+        "waves_csv": f"{base}/output/metrics_waves.csv",
+        "overlay_json": f"{base}/output/overlay/tracks.json",
+        "overlay_json_partial": f"{base}/output/overlay/tracks.partial.json",
+        "run_json": f"{base}/run.json",
+        "events_ndjson": f"{base}/events.ndjson",
+        "progress_json": f"{base}/output/progress.json",
         "plots_dir": f"{base}/plots",
         "output_dir": f"{base}/output",
         "base_image": f"{base}/output/base.png",
@@ -331,7 +356,7 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
     state.set_status("RUNNING")
     loop = asyncio.get_running_loop()
     bridge_q: asyncio.Queue[JobEvent] = asyncio.Queue()
-    terminal_seen = False  # add
+    terminal_seen = False
 
     def _runner_sync():
         got_terminal = False
@@ -367,7 +392,7 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
         while True:
             evt: JobEvent = await bridge_q.get()
             if evt.phase in ("ERROR", "DONE", "CANCELLED"):
-                terminal_seen = True  # add
+                terminal_seen = True
                 state.set_status(evt.phase, error=(evt.message if evt.phase == "ERROR" else None))
             await state.publish(evt)
             if evt.phase in ("ERROR", "DONE", "CANCELLED"):
@@ -380,10 +405,10 @@ async def _run_pipeline(state: _RunState, config_overrides: Optional[dict], verb
         state.set_status("ERROR", error=str(e))
         await state.publish(JobEvent(phase="ERROR", message=str(e), progress=1.0))
     finally:
-        if not terminal_seen:  # only synthesize if nothing terminal got through
+        if not terminal_seen:
             terminal = state.status if state.status in ("DONE", "ERROR", "CANCELLED") else "ERROR"
             await state.publish(JobEvent(phase=terminal, message="Run finished", progress=1.0))
-    
+
 def _synthesize_info_from_dir(d: Path) -> Optional[RunInfo]:
     rj = _run_json_path(d.name)
     meta = _load_run_json(rj) or {}
@@ -489,26 +514,38 @@ async def list_runs():
 async def get_run(run_id: str):
     """Run status + best-effort artifact URLs."""
     st = _RUNS.get(run_id)
-    if not st:
+    if st:
+        return RunStatusResponse(info=st.info(), artifacts=_artifact_urls_by_state(st))
+
+    # Fallback to disk-only (e.g., after API restart)
+    d = _run_dir(run_id)
+    if not d.exists():
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    return RunStatusResponse(info=st.info(), artifacts=_artifact_urls(st))
+    info = _synthesize_info_from_dir(d)
+    if not info:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+    return RunStatusResponse(info=info, artifacts=_artifact_urls_by_id(run_id))
 
 
 @app.get("/api/runs/{run_id}/artifacts")
 async def get_run_artifacts(run_id: str):
     """Raw artifact URL map (even if files not yet available)."""
     st = _RUNS.get(run_id)
-    if not st:
+    if st:
+        return JSONResponse(_artifact_urls_by_state(st))
+    # disk fallback
+    d = _run_dir(run_id)
+    if not d.exists():
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    return JSONResponse(_artifact_urls(st))
+    return JSONResponse(_artifact_urls_by_id(run_id))
 
 
 @app.get("/api/runs/{run_id}/events")
-async def stream_events(run_id: str, replay: int = Query(0, description="1 = replay historical events first")):
+async def stream_events(run_id: str, replay: int = Query(0, description=">1 = last N historical events first")):
     """
     Server-Sent Events stream of JobEvent for the given run.
     Browser usage:
-      const es = new EventSource(`/api/runs/${runId}/events?replay=1`);
+      const es = new EventSource(`/api/runs/${runId}/events?replay=100`);
       es.onmessage = (e) => { const evt = JSON.parse(e.data); ... }
     """
     st = _RUNS.get(run_id)
@@ -559,25 +596,28 @@ async def stream_events(run_id: str, replay: int = Query(0, description="1 = rep
 
     async def gen():
         try:
+            # Initial snapshot
             yield {"event": "message", "data": json.dumps({"phase": st.status, "message": "subscribed", "progress": 0.0})}
-            if replay:
+
+            # OPTIONAL REPLAY: stream historical events from NDJSON first
+            if replay and replay > 0:
                 nd = _events_path(st.run_id)
                 if nd.exists():
                     try:
-                        lines_iter = open(nd)
-                        if replay > 1:
-                            lines_iter = deque(lines_iter, maxlen=replay)
-                        for line in lines_iter:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                payload = json.loads(line)
-                                payload = _rewrite_payload(payload)
-                                yield {"event": "message", "data": json.dumps(payload)}
-                            except Exception:
-                                continue
+                        with nd.open() as f:
+                            lines_iter = f if replay == 1 else deque(f, maxlen=replay)
+                            for line in lines_iter:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    payload = json.loads(line)
+                                    payload = _rewrite_payload(payload)
+                                    yield {"event": "message", "data": json.dumps(payload)}
+                                except Exception:
+                                    continue
                     except Exception:
+                        # ignore replay errors, continue with live
                         pass
 
             # Now live events
@@ -588,21 +628,27 @@ async def stream_events(run_id: str, replay: int = Query(0, description="1 = rep
                 yield {"event": "message", "data": json.dumps(payload)}
                 if evt.phase in ("DONE", "ERROR", "CANCELLED"):
                     break
+        except asyncio.CancelledError:
+            # client disconnected
+            return
         finally:
             await st.remove_subscriber(q)
 
-    # keep-alive ping (seconds)
-    return EventSourceResponse(gen(), ping=15)
+    # keep-alive ping (seconds) — slightly longer to reduce noisy disconnect warnings
+    return EventSourceResponse(gen(), ping=25)
 
 
 @app.get("/api/runs/{run_id}/overlay")
 async def get_overlay(run_id: str):
     """Return overlay JSON (tracks.json or partial if still running)."""
     st = _RUNS.get(run_id)
-    if not st:
+    base = _run_dir(run_id)
+    if not (st or base.exists()):
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    final = st.output_dir / "overlay" / "tracks.json"
-    partial = st.output_dir / "overlay" / "tracks.partial.json"
+
+    output_dir = Path(st.output_dir) if st else (base / "output")
+    final = output_dir / "overlay" / "tracks.json"
+    partial = output_dir / "overlay" / "tracks.partial.json"
     path = final if final.exists() else partial
     if not path.exists():
         raise HTTPException(status_code=404, detail="Overlay not available yet")
@@ -615,9 +661,11 @@ async def get_overlay(run_id: str):
 async def get_base_image(run_id: str):
     """Serve the base image used for overlay (copied by the pipeline as base.png)."""
     st = _RUNS.get(run_id)
-    if not st:
+    base = _run_dir(run_id)
+    if not (st or base.exists()):
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    img = st.output_dir / "base.png"
+    output_dir = Path(st.output_dir) if st else (base / "output")
+    img = output_dir / "base.png"
     if not img.exists():
         raise HTTPException(status_code=404, detail="Base image not available yet")
     return FileResponse(str(img), media_type="image/png")
@@ -627,16 +675,45 @@ async def get_base_image(run_id: str):
 async def list_wave_windows(run_id: str, track: Optional[str] = None):
     """List PNGs under plots/<track>/peak_windows (as /runs URLs)."""
     st = _RUNS.get(run_id)
-    if not st:
+    base = _run_dir(run_id)
+    if not (st or base.exists()):
         raise HTTPException(status_code=404, detail="Unknown run_id")
     if not track:
         raise HTTPException(status_code=400, detail="Query param 'track' is required")
-    win_dir = st.plots_dir / str(track) / "peak_windows"
+    plots_dir = Path(st.plots_dir) if st else (base / "plots")
+    win_dir = plots_dir / str(track) / "peak_windows"
     if not win_dir.exists():
         return JSONResponse({"images": []})
     files = sorted([p for p in win_dir.glob("*.png")])
-    urls = [f"/runs/{st.run_id}/plots/{track}/peak_windows/{p.name}" for p in files]
+    urls = [f"/runs/{run_id}/plots/{track}/peak_windows/{p.name}" for p in files]
     return JSONResponse({"images": urls})
+
+
+@app.get("/api/runs/{run_id}/tracks")
+async def list_tracks(run_id: str):
+    """
+    List per-track .npy files with URLs.
+    Preference: /runs/<id>/output/tracks/*.npy
+    Fallback: search for **/kymobutler_output/*.npy within the run directory.
+    """
+    base = _run_dir(run_id)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+
+    preferred = base / "output" / "tracks"
+    paths: List[Path] = []
+    if preferred.exists():
+        paths = sorted(preferred.glob("*.npy"))
+
+    # fallback search
+    if not paths:
+        paths = sorted(base.glob("**/kymobutler_output/*.npy"))
+
+    items = [
+        {"id": p.stem, "url": f"/runs/{run_id}/{p.relative_to(base).as_posix()}"}
+        for p in paths
+    ]
+    return {"count": len(items), "tracks": items}
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -662,7 +739,6 @@ async def resume_run(run_id: str, verbose: bool = Form(False)):
     """
     Basic resume: re-run the pipeline for this run_id using existing inputs/config.
     (Your pipeline already prefers existing .npy → will skip Kymo phase.)
-    For true step-level resume, add checkpoint support in the pipeline and plumb it here.
     """
     st = _RUNS.get(run_id)
     if not st:
@@ -671,13 +747,12 @@ async def resume_run(run_id: str, verbose: bool = Form(False)):
     if st.status == "RUNNING":
         return {"run_id": run_id, "status": st.status, "message": "Run is already running"}
 
-    # Clear cancel flag if previously set
     if st.cancel_event.is_set():
         st.cancel_event.clear()
 
-    # Start worker again (same run id, artifacts will overwrite/append)
     asyncio.create_task(_run_pipeline(st, config_overrides=None, verbose=verbose))
     return {"run_id": run_id, "status": "RUNNING"}
+
 
 @app.get("/api/runs/{run_id}/progress")
 async def get_progress(run_id: str):
@@ -692,24 +767,29 @@ async def get_progress(run_id: str):
       }
     """
     st = _RUNS.get(run_id)
-    if not st:
-        raise HTTPException(status_code=404, detail="Unknown run_id")
 
-    progress_path, marker_dirs = _resolve_progress_paths(st)
+    # Preferred: with a live state (accurate config resolution)
+    if st:
+        progress_path, marker_dirs = _resolve_progress_paths_for_state(st)
+    else:
+        # Disk fallback (after restart)
+        base = _run_dir(run_id)
+        if not base.exists():
+            raise HTTPException(status_code=404, detail="Unknown run_id")
+        progress_path, marker_dirs = _resolve_progress_paths_for_disk(run_id)
 
     # 1) Preferred: read progress.json
     if progress_path.exists():
         try:
             with progress_path.open() as f:
                 data = json.load(f)
-            # add a hint for clients
             data.setdefault("source", "file")
             return JSONResponse(data)
-        except Exception as e:
+        except Exception:
             # fall through to synthesized
             pass
 
-    # 2) Synthesized fallback
+    # 2) Synthesized fallback using marker dirs + events.ndjson
     processed_count = 0
     for md in marker_dirs:
         if md.exists():
@@ -722,7 +802,6 @@ async def get_progress(run_id: str):
     skipped_count: Optional[int] = None
     last_updated: Optional[str] = None
 
-    # Try to infer totals from events.ndjson
     nd = _events_path(run_id)
     if nd.exists():
         try:
@@ -734,15 +813,12 @@ async def get_progress(run_id: str):
                         continue
                     try:
                         evt = json.loads(line)
-                        # resume event has explicit total
                         if isinstance(evt.get("extra"), dict):
                             extra = evt["extra"]
                             if "total" in extra and isinstance(extra["total"], int):
                                 max_total_tracks = max(max_total_tracks, int(extra["total"]))
                             if "total_tracks" in extra and isinstance(extra["total_tracks"], int):
-                                # kymo phase emits cumulative discovered tracks; take max
                                 max_total_tracks = max(max_total_tracks, int(extra["total_tracks"]))
-                        # capture last updated timestamp-ish from event order
                         last_updated = evt.get("ts") or last_updated
                     except Exception:
                         continue
@@ -753,28 +829,51 @@ async def get_progress(run_id: str):
     payload = {
         "totalTracks": total_tracks if total_tracks is not None else (processed_count if processed_count else None),
         "processedCount": int(processed_count),
-        "skippedCount": skipped_count,   # unknown without progress.json; client should treat null as "n/a"
-        "lastUpdatedAt": last_updated,   # may be null; progress.json is authoritative when present
+        "skippedCount": skipped_count,
+        "lastUpdatedAt": last_updated,
         "source": "synthesized",
     }
     return JSONResponse(payload)
+
 
 @app.get("/api/health")
 def health():
     return {"ok": True, "version": app.version}
 
+
 @app.delete("/api/runs/{run_id}")
-async def delete_run(run_id: str):
+async def delete_run(run_id: str, force: int = Query(0, description="1 = cancel if running, then delete")):
     st = _RUNS.get(run_id)
+    base = _run_dir(run_id)
+    if not base.exists() and not st:
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+
+    # If active
     if st and st.status in ("QUEUED", "RUNNING"):
-        raise HTTPException(status_code=409, detail="Cannot delete an active run")
+        if not force:
+            raise HTTPException(status_code=409, detail="Cannot delete an active run (pass ?force=1 to cancel+delete)")
+        # request cancel
+        st.cancel_event.set()
+        # give the worker a brief chance to exit cleanly
+        try:
+            if st.worker_task:
+                await asyncio.wait_for(st.worker_task, timeout=2.0)
+        except Exception:
+            # best-effort: try to cancel the task cooperatively
+            try:
+                st.worker_task.cancel()  # type: ignore
+            except Exception:
+                pass
+
+    # Remove directory
     try:
-        shutil.rmtree(_run_dir(run_id))
-    except FileNotFoundError:
-        pass
+        shutil.rmtree(base, ignore_errors=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
     _RUNS.pop(run_id, None)
     return {"deleted": run_id}
-
+    
 
 # Dev convenience: run with `python -m src.service.api`
 if __name__ == "__main__":
