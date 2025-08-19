@@ -1,9 +1,8 @@
 // frontend/src/hooks/useSSE.ts
 import * as React from "react";
+import { SSEStatus } from "@/utils/types";
 
-export type SSEStatus = "idle" | "connecting" | "open" | "error" | "closed";
-
-export interface UseSSEOptions {
+export interface UseSSEOptions<T = any> {
   /** If API is on a different origin, pass absolute URL. If null/undefined, the hook stays idle. */
   url?: string | null;
   /** Usually false for our API. */
@@ -14,6 +13,12 @@ export interface UseSSEOptions {
   reconnectDelayMs?: number;
   /** Maximum reconnect delay (ms). */
   maxReconnectDelayMs?: number;
+  /** Keep at most the last N messages in memory (prevents unbounded growth). */
+  maxBuffer?: number;
+  /** Start in paused mode (still connected; we just don't push to the buffer/callback). */
+  paused?: boolean;
+  /** Optional per-message callback. */
+  onMessage?: (msg: SSEMessage<T>) => void;
 }
 
 export interface SSEMessage<T = any> {
@@ -22,27 +27,48 @@ export interface SSEMessage<T = any> {
   data: T | null;
   /** The raw text received from the SSE `data:` line. */
   text: string;
+  /** Last-Event-ID, if provided by the server. */
+  lastEventId?: string;
 }
 
-export function useSSE<T = any>(opts: UseSSEOptions) {
+export function useSSE<T = any>(opts: UseSSEOptions<T>) {
   const {
     url,
     withCredentials = false,
     autoReconnect = true,
     reconnectDelayMs = 800,
     maxReconnectDelayMs = 10_000,
+    maxBuffer = 2000,
+    paused: pausedProp = false,
+    onMessage,
   } = opts;
 
+  // Public state
   const [status, setStatus] = React.useState<SSEStatus>("idle");
   const [last, setLast] = React.useState<SSEMessage<T> | null>(null);
   const [messages, setMessages] = React.useState<SSEMessage<T>[]>([]);
+  const [paused, _setPaused] = React.useState<boolean>(pausedProp);
 
-  // internal refs/state
+  // Internal refs/state
   const esRef = React.useRef<EventSource | null>(null);
-  const timerRef = React.useRef<number | null>(null);
+  const timerRef = React.useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const backoffRef = React.useRef<number>(reconnectDelayMs);
   const mountedRef = React.useRef<boolean>(false);
   const [connKey, setConnKey] = React.useState<number>(0); // bump to force reconnection
+
+  // Volatile options in refs (don’t trigger reconnects when they change)
+  const pausedRef = React.useRef<boolean>(pausedProp);
+  const onMessageRef = React.useRef<typeof onMessage>(onMessage);
+  const maxBufferRef = React.useRef<number>(maxBuffer);
+
+  React.useEffect(() => { pausedRef.current = pausedProp; _setPaused(pausedProp); }, [pausedProp]);
+  React.useEffect(() => { onMessageRef.current = onMessage; }, [onMessage]);
+  React.useEffect(() => { maxBufferRef.current = maxBuffer; }, [maxBuffer]);
+
+  const setPaused = React.useCallback((p: boolean) => {
+    pausedRef.current = p;
+    _setPaused(p);
+  }, []);
 
   const clearTimer = React.useCallback(() => {
     if (timerRef.current) {
@@ -51,14 +77,23 @@ export function useSSE<T = any>(opts: UseSSEOptions) {
     }
   }, []);
 
-  const close = React.useCallback(() => {
-    clearTimer();
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-    if (mountedRef.current) setStatus("closed");
-  }, [clearTimer]);
+  /**
+   * Close the EventSource. If reason==="error", we keep the "error" status
+   * instead of overwriting it with "closed".
+   */
+  const close = React.useCallback(
+    (reason: "manual" | "error" | "cleanup" = "manual") => {
+      clearTimer();
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+      if (mountedRef.current && reason !== "error") {
+        setStatus("closed");
+      }
+    },
+    [clearTimer]
+  );
 
   const requestReconnect = React.useCallback(() => {
     // exponential backoff within bounds
@@ -69,16 +104,15 @@ export function useSSE<T = any>(opts: UseSSEOptions) {
     );
     clearTimer();
     timerRef.current = window.setTimeout(() => {
-      // bump key to re-run the effect and recreate the EventSource
       setConnKey((k) => k + 1);
-    }, delay) as unknown as number;
+    }, delay);
   }, [clearTimer, reconnectDelayMs, maxReconnectDelayMs]);
 
   React.useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      close();
+      close("cleanup");
     };
   }, [close]);
 
@@ -90,12 +124,19 @@ export function useSSE<T = any>(opts: UseSSEOptions) {
       return;
     }
 
-    // Always start with a clean slate for (re)connect
+    // Start with a clean slate for (re)connect
     close();
     if (mountedRef.current) setStatus("connecting");
 
-    // Normalize URL (absolute or relative)
-    const finalUrl = new URL(url, window.location.origin).toString();
+    // Resolve relative/absolute URL safely
+    let finalUrl: string;
+    try {
+      finalUrl = new URL(url, window.location.origin).toString();
+    } catch {
+      // If URL construction fails, surface as error & don't loop
+      if (mountedRef.current) setStatus("error");
+      return;
+    }
 
     const es = new EventSource(finalUrl, { withCredentials });
     esRef.current = es;
@@ -107,7 +148,7 @@ export function useSSE<T = any>(opts: UseSSEOptions) {
 
     es.onerror = () => {
       if (mountedRef.current) setStatus("error");
-      close();
+      close("error");
       if (autoReconnect) requestReconnect();
     };
 
@@ -121,28 +162,55 @@ export function useSSE<T = any>(opts: UseSSEOptions) {
           // Non-JSON keep-alives or plain text are fine; leave parsed = null
         }
       }
-      const msg: SSEMessage<T> = { raw: evt, text, data: parsed };
+      const msg: SSEMessage<T> = {
+        raw: evt,
+        text,
+        data: parsed,
+        // MessageEvent in browsers includes lastEventId
+        lastEventId: (evt as any).lastEventId,
+      };
       if (!mountedRef.current) return;
+
       setLast(msg);
-      setMessages((prev) => [...prev, msg]);
+
+      if (!pausedRef.current) {
+        const cb = onMessageRef.current;
+        if (cb) {
+          try { cb(msg); } catch { /* ignore user callback errors */ }
+        }
+        setMessages((prev) => {
+          const next = [...prev, msg];
+          const cap = maxBufferRef.current ?? 2000;
+          return next.length > cap ? next.slice(next.length - cap) : next;
+        });
+      }
     };
 
     return () => {
       es.close();
       esRef.current = null;
       clearTimer();
-      // don't force status here; `close()` is called by outer cleanup on unmount/url change
     };
-    // Reconnect when url / credentials change OR when we bump connKey.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, withCredentials, connKey, autoReconnect, reconnectDelayMs, maxReconnectDelayMs, requestReconnect, close]);
+    // Only dependencies that truly require reconnect:
+  }, [
+    url,
+    withCredentials,
+    connKey,
+    autoReconnect,
+    reconnectDelayMs,
+    maxReconnectDelayMs,
+    requestReconnect,
+    close,
+  ]);
 
-  // Public API
+  // Public API (unchanged)
   return {
     status,
-    last,        // { data: T | null, text, raw }
-    messages,    // all messages so far
-    close,       // manually close
+    last,            // { data: T | null, text, raw, lastEventId? }
+    messages,        // last N messages
+    paused,
+    setPaused,
+    close,           // manually close
     reconnect: () => {
       backoffRef.current = reconnectDelayMs; // reset backoff
       setConnKey((k) => k + 1);
