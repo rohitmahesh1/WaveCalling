@@ -1,0 +1,19 @@
+/* src/index.css */
+@import "tailwindcss";
+
+/* project-wide theme tokens via @theme */
+@theme {
+  /* fonts */
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+
+  /* colors (example: console look) */
+  --color-console-900: #0b0e14;
+  --color-console-700: #1a1f29;
+
+  /* radius tweaks */
+  --radius-xl: 1rem;
+}
+
+/* set your base canvas look */
+html, body, #root { height: 100%; }
+body { background: var(--color-console-900); }
