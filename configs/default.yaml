@@ -58,6 +58,9 @@ features:
 service:
   partial_every_tracks: 250      # write tracks.partial.json every N tracks
   write_progress_every_secs: 10  # update progress.json cadence
+  overlay:
+    write_every_tracks: 1
+    format: ndjson
   resume:
     enabled: true
     marker_dir: "output/processed"   # per-track .done markers
