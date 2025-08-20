@@ -4,6 +4,7 @@ import { useDashboard } from "@/context/DashboardContext";
 import { listRuns } from "@/utils/api";
 import type { RunInfo } from "@/utils/types";
 import RunRow from "@/components/RunRow";
+import SearchInput from "@/components/SearchInput";
 
 export default function RunsPanel() {
   const { selectedRunId, setSelectedRunId } = useDashboard();
@@ -37,7 +38,9 @@ export default function RunsPanel() {
     const needle = q.trim().toLowerCase();
     if (!needle) return runs;
     return runs.filter((r) =>
-      [r.run_id, r.name, r.status, r.created_at].some((s) => String(s).toLowerCase().includes(needle))
+      [r.run_id, r.name, r.status, r.created_at].some((s) =>
+        String(s).toLowerCase().includes(needle)
+      )
     );
   }, [q, runs]);
 
@@ -46,11 +49,13 @@ export default function RunsPanel() {
       <header className="flex items-center justify-between gap-2">
         <h2 className="text-slate-200 font-semibold">Runs</h2>
         <div className="flex items-center gap-2">
-          <input
+          <SearchInput
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={setQ}
             placeholder="Search runs…"
-            className="text-sm bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-400"
+            className="w-48"
+            onEnter={() => void refresh()}
+            onClear={() => setQ("")}
           />
           <button
             onClick={() => void refresh()}
