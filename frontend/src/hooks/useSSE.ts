@@ -1,6 +1,7 @@
 // frontend/src/hooks/useSSE.ts
 import * as React from "react";
-import { SSEStatus } from "@/utils/types";
+
+export type SSEStatus = "idle" | "connecting" | "open" | "error" | "closed";
 
 export interface UseSSEOptions<T = any> {
   /** If API is on a different origin, pass absolute URL. If null/undefined, the hook stays idle. */
@@ -13,12 +14,15 @@ export interface UseSSEOptions<T = any> {
   reconnectDelayMs?: number;
   /** Maximum reconnect delay (ms). */
   maxReconnectDelayMs?: number;
-  /** Keep at most the last N messages in memory (prevents unbounded growth). */
+
+  /** Keep at most the last N messages in memory (prevents unbounded growth). Default 500. */
   maxBuffer?: number;
   /** Start in paused mode (still connected; we just don't push to the buffer/callback). */
   paused?: boolean;
   /** Optional per-message callback. */
   onMessage?: (msg: SSEMessage<T>) => void;
+  /** Suppress repeated identical `text` messages received within this window (ms). Default 250ms. */
+  dedupeWindowMs?: number;
 }
 
 export interface SSEMessage<T = any> {
@@ -38,9 +42,10 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
     autoReconnect = true,
     reconnectDelayMs = 800,
     maxReconnectDelayMs = 10_000,
-    maxBuffer = 2000,
+    maxBuffer = 500,
     paused: pausedProp = false,
     onMessage,
+    dedupeWindowMs = 250,
   } = opts;
 
   // Public state
@@ -49,17 +54,21 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
   const [messages, setMessages] = React.useState<SSEMessage<T>[]>([]);
   const [paused, _setPaused] = React.useState<boolean>(pausedProp);
 
-  // Internal refs/state
+  // Internal refs
   const esRef = React.useRef<EventSource | null>(null);
-  const timerRef = React.useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const timerRef = React.useRef<number | null>(null);
   const backoffRef = React.useRef<number>(reconnectDelayMs);
   const mountedRef = React.useRef<boolean>(false);
-  const [connKey, setConnKey] = React.useState<number>(0); // bump to force reconnection
+  const [connKey, setConnKey] = React.useState<number>(0);
 
-  // Volatile options in refs (don’t trigger reconnects when they change)
+  // Volatile options in refs
   const pausedRef = React.useRef<boolean>(pausedProp);
   const onMessageRef = React.useRef<typeof onMessage>(onMessage);
   const maxBufferRef = React.useRef<number>(maxBuffer);
+
+  // Deduplication refs
+  const lastTextRef = React.useRef<string>("");
+  const lastTextAtRef = React.useRef<number>(0);
 
   React.useEffect(() => { pausedRef.current = pausedProp; _setPaused(pausedProp); }, [pausedProp]);
   React.useEffect(() => { onMessageRef.current = onMessage; }, [onMessage]);
@@ -77,10 +86,6 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
     }
   }, []);
 
-  /**
-   * Close the EventSource. If reason==="error", we keep the "error" status
-   * instead of overwriting it with "closed".
-   */
   const close = React.useCallback(
     (reason: "manual" | "error" | "cleanup" = "manual") => {
       clearTimer();
@@ -96,7 +101,6 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
   );
 
   const requestReconnect = React.useCallback(() => {
-    // exponential backoff within bounds
     const delay = backoffRef.current;
     backoffRef.current = Math.min(
       Math.max(Math.floor(backoffRef.current * 1.7), reconnectDelayMs),
@@ -105,7 +109,7 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
     clearTimer();
     timerRef.current = window.setTimeout(() => {
       setConnKey((k) => k + 1);
-    }, delay);
+    }, delay) as unknown as number;
   }, [clearTimer, reconnectDelayMs, maxReconnectDelayMs]);
 
   React.useEffect(() => {
@@ -117,23 +121,19 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
   }, [close]);
 
   React.useEffect(() => {
-    // If no URL, stay idle and ensure connection is closed.
     if (!url) {
       close();
       if (mountedRef.current) setStatus("idle");
       return;
     }
 
-    // Start with a clean slate for (re)connect
     close();
     if (mountedRef.current) setStatus("connecting");
 
-    // Resolve relative/absolute URL safely
     let finalUrl: string;
     try {
       finalUrl = new URL(url, window.location.origin).toString();
     } catch {
-      // If URL construction fails, surface as error & don't loop
       if (mountedRef.current) setStatus("error");
       return;
     }
@@ -142,7 +142,7 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
     esRef.current = es;
 
     es.onopen = () => {
-      backoffRef.current = reconnectDelayMs; // reset backoff
+      backoffRef.current = reconnectDelayMs;
       if (mountedRef.current) setStatus("open");
     };
 
@@ -154,19 +154,25 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
 
     es.onmessage = (evt: MessageEvent) => {
       const text = (evt.data ?? "") as string;
+
+      // deduplication check
+      const now = Date.now();
+      if (text && text === lastTextRef.current && now - lastTextAtRef.current <= dedupeWindowMs) {
+        return;
+      }
+      lastTextRef.current = text;
+      lastTextAtRef.current = now;
+
       let parsed: T | null = null;
       if (typeof text === "string" && text.length) {
         try {
           parsed = JSON.parse(text) as T;
-        } catch {
-          // Non-JSON keep-alives or plain text are fine; leave parsed = null
-        }
+        } catch {}
       }
       const msg: SSEMessage<T> = {
         raw: evt,
         text,
         data: parsed,
-        // MessageEvent in browsers includes lastEventId
         lastEventId: (evt as any).lastEventId,
       };
       if (!mountedRef.current) return;
@@ -176,11 +182,11 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
       if (!pausedRef.current) {
         const cb = onMessageRef.current;
         if (cb) {
-          try { cb(msg); } catch { /* ignore user callback errors */ }
+          try { cb(msg); } catch {}
         }
         setMessages((prev) => {
           const next = [...prev, msg];
-          const cap = maxBufferRef.current ?? 2000;
+          const cap = maxBufferRef.current ?? 500;
           return next.length > cap ? next.slice(next.length - cap) : next;
         });
       }
@@ -191,7 +197,6 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
       esRef.current = null;
       clearTimer();
     };
-    // Only dependencies that truly require reconnect:
   }, [
     url,
     withCredentials,
@@ -201,18 +206,18 @@ export function useSSE<T = any>(opts: UseSSEOptions<T>) {
     maxReconnectDelayMs,
     requestReconnect,
     close,
+    dedupeWindowMs,
   ]);
 
-  // Public API (unchanged)
   return {
     status,
-    last,            // { data: T | null, text, raw, lastEventId? }
-    messages,        // last N messages
+    last,
+    messages,
     paused,
     setPaused,
-    close,           // manually close
+    close,
     reconnect: () => {
-      backoffRef.current = reconnectDelayMs; // reset backoff
+      backoffRef.current = reconnectDelayMs;
       setConnKey((k) => k + 1);
     },
   };
