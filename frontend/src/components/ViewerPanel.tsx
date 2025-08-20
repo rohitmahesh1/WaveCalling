@@ -45,6 +45,28 @@ export default function ViewerPanel({
   loading,
   onRefresh,
 }: Props) {
+  const hasOverlay = !!overlay && (overlay.tracks?.length || 0) > 0;
+
+  const statusNode = (() => {
+    if (loading && !hasOverlay) return <span className="italic">Loading overlay…</span>;
+    if (loading && hasOverlay) return <span className="italic">Refreshing overlay…</span>;
+    if (hasOverlay && summary) {
+      return (
+        <>
+          tracks:{" "}
+          <span className="text-slate-300">
+            {summary.tracks.toLocaleString()}
+          </span>{" "}
+          · points:{" "}
+          <span className="text-slate-300">
+            {summary.points.toLocaleString()}
+          </span>
+        </>
+      );
+    }
+    return <span className="italic">No overlay loaded yet</span>;
+  })();
+
   return (
     <section className="rounded-xl border border-slate-700/50 bg-console-700 p-4">
       <div className="flex items-center justify-between gap-3">
@@ -58,20 +80,7 @@ export default function ViewerPanel({
       </div>
 
       <div className="mt-2 text-xs text-slate-400">
-        {summary ? (
-          <>
-            tracks:{" "}
-            <span className="text-slate-300">
-              {summary.tracks.toLocaleString()}
-            </span>{" "}
-            · points:{" "}
-            <span className="text-slate-300">
-              {summary.points.toLocaleString()}
-            </span>
-          </>
-        ) : (
-          <span className="italic">No overlay loaded yet</span>
-        )}
+        {statusNode}
         {options.showBase && baseImageUrl && (
           <span className="ml-3">
             base:{" "}
@@ -87,7 +96,7 @@ export default function ViewerPanel({
         )}
       </div>
 
-      {overlay && overlay.tracks?.length ? (
+      {hasOverlay ? (
         <OverlayCanvas
           payload={overlay}
           baseImageUrl={options.showBase ? baseImageUrl ?? undefined : undefined}
