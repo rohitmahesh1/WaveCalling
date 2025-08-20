@@ -13,6 +13,8 @@ import ProgressBar from "@/components/ProgressBar";
 import RunStatusBadge from "@/components/RunStatusBadge";
 import EmptyState from "@/components/EmptyState";
 
+import ConfigEditorPanel from "@/components/config/ConfigEditorPanel";
+
 import type { JobEvent } from "@/utils/types";
 import { cancelRun, resumeRun } from "@/utils/api";
 
@@ -91,6 +93,9 @@ function DashboardInner() {
   } = useDashboard();
 
   const safeRunId = React.useMemo(() => sanitizeRunId(selectedRunId), [selectedRunId]);
+
+  const [overridesJson, setOverridesJson] = React.useState<string>("");
+
 
   // Toggle SSE on/off to prevent reconnect after terminal
   const [sseEnabled, setSseEnabled] = React.useState(true);
@@ -272,7 +277,10 @@ function DashboardInner() {
         </div>
 
         <div className="flex flex-col gap-4">
-          <UploadPanel onStarted={(rid) => setSelectedRunId(rid)} />
+          
+          <UploadPanel
+            onStarted={(rid) => setSelectedRunId(rid)} 
+          />
 
           <div className="rounded-xl border border-slate-700/50 bg-console-700 p-4">
             <div className="flex items-center justify-between gap-2">
