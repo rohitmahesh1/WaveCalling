@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
 import inspect
@@ -65,6 +66,28 @@ class RunResult:
 # Helpers
 # -----------------------
 
+def _safe_num(v):
+    """Return float(v) if finite, else None."""
+    try:
+        f = float(v)
+    except Exception:
+        return None
+    if math.isfinite(f):
+        return float(f)
+    return None
+
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Inf with None; convert numpy scalars to python."""
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if math.isfinite(float(obj)) else None
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(x) for x in obj]
+    return obj
+
 def _sample_name_from_arr_path(arr_path: Path) -> str:
     base = arr_path.parent.parent.name
     if base.endswith("_heatmap"):
@@ -92,6 +115,73 @@ def _sort_waves(df: pd.DataFrame) -> pd.DataFrame:
         kind="mergesort",
         ignore_index=True,
     )
+
+def _overlay_track_from_array(arr_path: Path, cfg: dict):
+    detrend_cfg = cfg.get("detrend", {}) or {}
+    peaks_cfg = cfg.get("peaks", {}) or {}
+    period_cfg = (cfg.get("period", {}) or {}).copy()
+    io_cfg = cfg.get("io", {}) or {}
+    sampling_rate = io_cfg.get("sampling_rate", period_cfg.get("sampling_rate", 1.0))
+    period_cfg.setdefault("sampling_rate", sampling_rate)
+
+    xy = np.load(arr_path)
+    x = xy[:, 0].astype(float)
+    y = xy[:, 1].astype(float)
+
+    residual = detrend_residual(x, y, **detrend_cfg)
+    peaks_idx, _ = detect_peaks(residual, **peaks_cfg)
+
+    # Frequency and period (guard against non-finite)
+    freq = estimate_dominant_frequency(residual, **period_cfg)
+    try:
+        freq = float(freq)
+    except Exception:
+        freq = float("nan")
+    period = frequency_to_period(freq) if (isinstance(freq, (int, float)) and math.isfinite(freq) and freq > 0) else float("nan")
+
+    # Amplitude (guard)
+    amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
+    mean_amp = float(np.mean(amps)) if amps.size > 0 else float("nan")
+
+    metrics = {
+        "dominant_frequency": _safe_num(freq),
+        "period": _safe_num(period),
+        "num_peaks": int(len(peaks_idx)),
+        "mean_amplitude": _safe_num(mean_amp),
+    }
+
+    track = {
+        "id": arr_path.stem,
+        "sample": _sample_name_from_arr_path(arr_path),
+        "poly": xy.astype(float).tolist(),   # keep as-is; assumed finite from extraction
+        "peaks": [int(i) for i in peaks_idx.tolist()],
+        "metrics": metrics,
+    }
+    return _sanitize_for_json(track)
+
+def _append_ndjson_line(path: Path, obj: dict) -> None:
+    obj = _sanitize_for_json(obj)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, allow_nan=False) + "\n")
+
+def _finalize_overlay_from_ndjson(ndjson_path: Path, final_json_path: Path) -> None:
+    tracks = []
+    if ndjson_path.exists():
+        with ndjson_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)      # may contain NaN from older runs
+                except Exception:
+                    continue
+                tracks.append(_sanitize_for_json(obj))
+    payload = _sanitize_for_json({"version": 1, "tracks": tracks})
+    final_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with final_json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, allow_nan=False)
 
 def _build_overlay_json(
     arr_paths: List[Path],
@@ -382,6 +472,16 @@ def iter_run_project(
     tracks_out = ensure_dir(output_dir)
     plots_dir = ensure_dir(plots_dir) if (viz_enabled and plots_dir) else None
 
+    service_cfg = (cfg.get("service") or {})
+    partial_every = int(service_cfg.get("partial_every_tracks", 250))
+    overlay_cfg = (service_cfg.get("overlay") or {})
+    overlay_every = int(overlay_cfg.get("write_every_tracks", 1))
+
+    overlay_dir = ensure_dir(Path(output_dir) / "overlay")
+    overlay_ndjson = overlay_dir / "tracks.ndjson"
+    overlay_partial_json = overlay_dir / "tracks.partial.json"  # optional (we can skip writing this)
+    overlay_final_json = overlay_dir / "tracks.json"
+
     track_results: List[dict] = []
     wave_results: List[dict] = []
 
@@ -400,36 +500,30 @@ def iter_run_project(
     last_progress_write = 0.0
 
     def _write_partials() -> dict:
-        """Write partial artifacts so the UI can preview them while running/cancelled."""
+        """Write partial CSVs only; overlay is maintained via NDJSON appends."""
         tracks_csv = tracks_out / "metrics.partial.csv"
         waves_csv = tracks_out / "metrics_waves.partial.csv"
-        overlay_json = tracks_out / "overlay" / "tracks.partial.json"
 
         df_tracks = pd.DataFrame(track_results)
         if not df_tracks.empty:
-            df_tracks.to_csv(tracks_csv, index=False)
+            tmp = tracks_csv.with_suffix(".tmp")
+            df_tracks.to_csv(tmp, index=False)
+            tmp.replace(tracks_csv)
         else:
             tracks_csv = None
 
         df_waves = pd.DataFrame(wave_results)
         if not df_waves.empty:
             df_waves = _sort_waves(df_waves)
-            df_waves.to_csv(waves_csv, index=False, na_rep="NA")
+            tmpw = waves_csv.with_suffix(".tmp")
+            df_waves.to_csv(tmpw, index=False, na_rep="NA")
+            tmpw.replace(waves_csv)
         else:
             waves_csv = None
 
-        try:
-            done_paths = [arr_paths_all[i] for i in sorted(processed_indices)]
-            _build_overlay_json(done_paths, cfg, overlay_json, log=get_logger("pipeline.overlay"))
-        except Exception:
-            overlay_json = None
-
-        extra = {"partial_index": partial_index}
+        extra = {"overlay_ndjson": str(overlay_ndjson)}
         if tracks_csv: extra["tracks_partial"] = str(tracks_csv)
         if waves_csv:  extra["waves_partial"] = str(waves_csv)
-        if overlay_json and overlay_json.exists(): extra["overlay_partial"] = str(overlay_json)
-        # also write progress on partials
-        _write_progress(total_tracks, len(processed_indices), skipped_count)
         return extra
 
     evt = JobEvent("PROCESS", f"Processing {total_tracks} track(s)", 0.60)
@@ -470,6 +564,12 @@ def iter_run_project(
             # update processed set
             processed_indices.add(arr_index[arr])
 
+            try:
+                overlay_track = _overlay_track_from_array(arr, cfg)
+                _append_ndjson_line(overlay_ndjson, overlay_track)
+            except Exception as e:
+                get_logger("pipeline.overlay").debug(f"overlay append failed for {arr}: {e}")
+
         except Exception as e:
             get_logger("pipeline.process").exception(f"Failed on {arr}: {e}")
 
@@ -490,6 +590,16 @@ def iter_run_project(
                 extra=extra,
             )
             _emit(progress_cb, evtp); yield evtp
+
+        # Overlay partial cadence (cheap): just signal the UI so it refetches
+        if (len(processed_indices) % max(1, overlay_every) == 0):
+            evtp2 = JobEvent(
+                "WRITE_PARTIAL",
+                f"Overlay appended ({len(processed_indices)})",
+                0.60 + 0.25 * (len(processed_indices) / max(1, total_tracks)),
+                extra={"overlay_ndjson": str(overlay_ndjson)},
+            )
+            _emit(progress_cb, evtp2); yield evtp2
 
         evt = JobEvent(
             "PROCESS",
@@ -525,11 +635,15 @@ def iter_run_project(
         )
         df_waves.to_csv(waves_csv, index=False)
 
-    # overlay JSON for the viewer
-    evt = JobEvent("OVERLAY", "Building overlay JSON", 0.88)
+    # overlay JSON for the viewer (finalize from NDJSON)
+    evt = JobEvent("OVERLAY", "Finalizing overlay JSON", 0.88)
     _emit(progress_cb, evt); yield evt
-    overlay_json = tracks_out / "overlay" / "tracks.json"
-    _build_overlay_json([arr_paths_all[i] for i in sorted(processed_indices)], cfg, overlay_json, log=get_logger("pipeline.overlay"))
+    try:
+        _finalize_overlay_from_ndjson(overlay_ndjson, overlay_final_json)
+    except Exception as e:
+        get_logger("pipeline.overlay").exception(f"Finalize overlay failed: {e}")
+    # overlay_json = tracks_out / "overlay" / "tracks.json"
+    #  _build_overlay_json([arr_paths_all[i] for i in sorted(processed_indices)], cfg, overlay_json, log=get_logger("pipeline.overlay"))
 
     # summary histograms (optional)
     if plots_dir is not None and make_summary_hists:

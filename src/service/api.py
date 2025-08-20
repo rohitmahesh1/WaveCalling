@@ -57,6 +57,19 @@ def _write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, indent=2)
     tmp.replace(path)
 
+def _sanitize_for_json(obj):
+    import math
+    import numpy as np  # ensure available here
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if math.isfinite(float(obj)) else None
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(x) for x in obj]
+    return obj
+
 def _append_event(run_id: str, evt: JobEvent) -> None:
     """Append an event to NDJSON log (best-effort; small writes)."""
     p = _events_path(run_id)
@@ -329,6 +342,7 @@ def _artifact_urls_by_state(state: _RunState) -> Dict[str, str]:
         "waves_csv": f"{base}/output/metrics_waves.csv",
         "overlay_json": f"{base}/output/overlay/tracks.json",
         "overlay_json_partial": f"{base}/output/overlay/tracks.partial.json",
+        "overlay_ndjson": f"{base}/output/overlay/tracks.ndjson",
         "run_json": f"{base}/run.json",
         "events_ndjson": f"{base}/events.ndjson",
         "progress_json": f"{base}/output/progress.json",
@@ -344,6 +358,7 @@ def _artifact_urls_by_id(run_id: str) -> Dict[str, str]:
         "waves_csv": f"{base}/output/metrics_waves.csv",
         "overlay_json": f"{base}/output/overlay/tracks.json",
         "overlay_json_partial": f"{base}/output/overlay/tracks.partial.json",
+        "overlay_ndjson": f"{base}/output/overlay/tracks.ndjson",
         "run_json": f"{base}/run.json",
         "events_ndjson": f"{base}/events.ndjson",
         "progress_json": f"{base}/output/progress.json",
@@ -640,21 +655,38 @@ async def stream_events(run_id: str, replay: int = Query(0, description=">1 = la
 
 @app.get("/api/runs/{run_id}/overlay")
 async def get_overlay(run_id: str):
-    """Return overlay JSON (tracks.json or partial if still running)."""
     st = _RUNS.get(run_id)
-    base = _run_dir(run_id)
-    if not (st or base.exists()):
+    if not st:
         raise HTTPException(status_code=404, detail="Unknown run_id")
+    final = st.output_dir / "overlay" / "tracks.json"
+    partial = st.output_dir / "overlay" / "tracks.partial.json"
+    ndjson = st.output_dir / "overlay" / "tracks.ndjson"
 
-    output_dir = Path(st.output_dir) if st else (base / "output")
-    final = output_dir / "overlay" / "tracks.json"
-    partial = output_dir / "overlay" / "tracks.partial.json"
-    path = final if final.exists() else partial
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Overlay not available yet")
-    with open(path) as f:
-        data = json.load(f)
-    return JSONResponse(data)
+    if final.exists():
+        with open(final) as f:
+            data = json.load(f)
+        return JSONResponse(_sanitize_for_json(data))
+
+    if partial.exists():
+        with open(partial) as f:
+            data = json.load(f)
+        return JSONResponse(_sanitize_for_json(data))
+
+    if ndjson.exists():
+        tracks = []
+        with open(ndjson) as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                tracks.append(_sanitize_for_json(obj))
+        return JSONResponse({"version": 1, "tracks": tracks})
+
+    raise HTTPException(status_code=404, detail="Overlay not available yet")
 
 
 @app.get("/api/runs/{run_id}/image")
