@@ -62,11 +62,13 @@ function suggestFilename(u: string, labelKey: string) {
 
 export default function ArtifactsPanel({ artifacts, className, title = "Artifacts" }: Props) {
   const [copiedKey, setCopiedKey] = React.useState<string | null>(null);
+  const [existing, setExisting] = React.useState<Record<string, boolean>>({}); // key -> exists?
 
-  const items = React.useMemo(() => {
-    if (!artifacts) return [];
-    const pairs = Object.entries(artifacts).filter(([, v]) => !!v);
-    return pairs.sort((a, b) => {
+  const pairs = React.useMemo(() => {
+    if (!artifacts) return [] as [string, string][];
+    const entries = Object.entries(artifacts).filter(([, v]) => !!v) as [string, string][];
+    // Sort by preferred order then alphabetically
+    entries.sort((a, b) => {
       const ai = ORDER.indexOf(a[0]);
       const bi = ORDER.indexOf(b[0]);
       if (ai !== -1 && bi !== -1) return ai - bi;
@@ -74,31 +76,57 @@ export default function ArtifactsPanel({ artifacts, className, title = "Artifact
       if (bi !== -1) return 1;
       return a[0].localeCompare(b[0]);
     });
+    return entries;
   }, [artifacts]);
+
+  // Validate which artifact URLs actually exist (HEAD)
+  React.useEffect(() => {
+    const ctrl = new AbortController();
+    async function validate() {
+      const res: Record<string, boolean> = {};
+      await Promise.all(
+        pairs.map(async ([k, url]) => {
+          try {
+            const r = await fetch(url, { method: "HEAD", cache: "no-cache", signal: ctrl.signal });
+            res[k] = r.ok;
+          } catch {
+            res[k] = false;
+          }
+        })
+      );
+      if (!ctrl.signal.aborted) setExisting(res);
+    }
+    if (pairs.length) validate();
+    else setExisting({});
+    return () => ctrl.abort();
+  }, [pairs]);
+
+  const visible = React.useMemo(
+    () => pairs.filter(([k]) => existing[k]),
+    [pairs, existing]
+  );
 
   const copy = React.useCallback(async (k: string, v: string) => {
     try {
       await navigator.clipboard.writeText(v);
       setCopiedKey(k);
-      window.setTimeout(() => setCopiedKey((curr) => (curr === k ? null : curr)), 1200);
+      setTimeout(() => setCopiedKey((curr) => (curr === k ? null : curr)), 1200);
     } catch {
-      /* no-op */
+      // ignore
     }
   }, []);
 
   return (
     <section className={`rounded-xl border border-slate-700/50 bg-console-700 p-4 ${className || ""}`}>
       <h2 className="text-slate-200 font-semibold">{title}</h2>
-
-      {(!artifacts || items.length === 0) ? (
-        <div className="text-sm text-slate-400 mt-3">No artifacts yet.</div>
+      {visible.length === 0 ? (
+        <div className="text-sm text-slate-400 mt-3">No artifacts available yet.</div>
       ) : (
         <ul className="mt-3 space-y-2">
-          {items.map(([k, url]) => {
-            const u = url as string;
-            const ext = getExt(u);
+          {visible.map(([k, url]) => {
+            const ext = getExt(url);
             const canDownload = DL_EXTS.has(ext);
-            const filename = suggestFilename(u, k);
+            const filename = suggestFilename(url, k);
 
             return (
               <li key={k} className="flex items-center justify-between gap-2">
@@ -112,39 +140,36 @@ export default function ArtifactsPanel({ artifacts, className, title = "Artifact
                     )}
                   </div>
                   <a
-                    href={u}
+                    href={url}
                     target="_blank"
                     rel="noreferrer"
-                    className="block truncate text-xs text-slate-400 hover:text-slate-300 underline decoration-slate-600 cursor-pointer"
-                    title={u}
+                    className="block truncate text-xs text-slate-400 hover:text-slate-300 underline decoration-slate-600"
+                    title={url}
                   >
-                    {u}
+                    {url}
                   </a>
                 </div>
-
                 <div className="flex items-center gap-2 shrink-0">
                   <a
-                    href={u}
+                    href={url}
                     target="_blank"
                     rel="noreferrer"
-                    className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800 cursor-pointer"
+                    className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800"
                   >
                     Open
                   </a>
-
                   {canDownload && (
                     <a
-                      href={u}
+                      href={url}
                       download={filename}
-                      className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800 cursor-pointer"
+                      className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800"
                     >
                       Download
                     </a>
                   )}
-
                   <button
-                    onClick={() => copy(k, u)}
-                    className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800 cursor-pointer"
+                    onClick={() => copy(k, url)}
+                    className="px-2.5 py-1 text-xs rounded border border-slate-600 text-slate-200 hover:bg-slate-800"
                   >
                     {copiedKey === k ? "Copied" : "Copy URL"}
                   </button>
