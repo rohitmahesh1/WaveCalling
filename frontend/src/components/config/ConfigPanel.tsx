@@ -86,18 +86,17 @@ export default function ConfigPanel({
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-[280px,1fr] gap-4">
-        <ConfigCategoryNav
+        {/* <ConfigCategoryNav
           items={items}
           activeId={activeId}
           onSelect={onSelect}
           className={navClassName}
-        />
+        /> */}
 
         <div
           className={`rounded-xl border border-slate-700/50 bg-console-700 p-4 min-h-[300px] ${contentClassName || ""}`}
         >
-          {/* The section content area scrolls independently if it gets long */}
-          <div className="max-h-[70vh] overflow-auto pr-1">
+          <div className="pr-1">
             {renderSection(activeId)}
           </div>
         </div>
