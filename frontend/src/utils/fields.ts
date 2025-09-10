@@ -57,7 +57,6 @@ export function flattenTrack(track: any): Record<string, any> {
     points: Array.isArray(track?.poly) ? track.poly.length : undefined,
     peaks_count: Array.isArray(track?.peaks) ? track.peaks.length : undefined,
     metrics: track?.metrics ?? {},
-    // You can include other top-level primitives here if needed
   };
 
   walk("", seed);
