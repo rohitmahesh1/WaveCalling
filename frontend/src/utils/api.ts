@@ -4,6 +4,8 @@ import type {
   RunStatusResponse,
   CreateRunResponse,
   ProgressResponse,
+  TracksListResponse,
+  TrackDetailResponse,
 } from "./types";
 
 function okOrThrow(r: Response, label: string) {
@@ -16,7 +18,7 @@ export async function listRuns(apiBase: string): Promise<RunInfo[]> {
   return r.json();
 }
 
-// FormData should contain files[] (one or more) + optional fields
+// FormData should contain files[] + optional fields
 export async function startRun(apiBase: string, form: FormData) {
   const r = await fetch(`${apiBase}/api/runs`, { method: "POST", body: form });
   okOrThrow(r, "startRun");
@@ -36,7 +38,6 @@ export async function cancelRun(apiBase: string, runId: string) {
 }
 
 export async function resumeRun(apiBase: string, runId: string, verbose = false) {
-  // FastAPI endpoint accepts form fields; empty body is fine.
   const body = verbose ? new URLSearchParams({ verbose: "true" }) : undefined;
   const r = await fetch(`${apiBase}/api/runs/${encodeURIComponent(runId)}/resume`, {
     method: "POST",
@@ -47,14 +48,7 @@ export async function resumeRun(apiBase: string, runId: string, verbose = false)
   return r.json();
 }
 
-/**
- * Delete a run. If `force` is true, the server will cancel an active run then delete it.
- */
-export async function deleteRun(
-  apiBase: string,
-  runId: string,
-  opts: { force?: boolean } = {}
-) {
+export async function deleteRun(apiBase: string, runId: string, opts: { force?: boolean } = {}) {
   const qs = opts.force ? "?force=1" : "";
   const r = await fetch(`${apiBase}/api/runs/${encodeURIComponent(runId)}${qs}`, { method: "DELETE" });
   okOrThrow(r, "deleteRun");
@@ -67,12 +61,24 @@ export async function getProgress(apiBase: string, runId: string): Promise<Progr
   return r.json();
 }
 
-/** Lightweight listing of per-track .npy files for a run. */
-export type TracksListItem = { id: string; url: string };
-export type TracksListResponse = { count: number; tracks: TracksListItem[] };
-
 export async function listTracks(apiBase: string, runId: string): Promise<TracksListResponse> {
   const r = await fetch(`${apiBase}/api/runs/${encodeURIComponent(runId)}/tracks`, { cache: "no-cache" });
   okOrThrow(r, "listTracks");
+  return r.json();
+}
+
+// >>> NEW: detail endpoint for exact Python regression arrays, peaks, etc.
+export async function getTrackDetail(
+  apiBase: string,
+  runId: string,
+  trackId: string,
+  opts: { includeSine?: boolean } = {}
+): Promise<TrackDetailResponse> {
+  const qs = opts.includeSine ? "?include_sine=1" : "";
+  const r = await fetch(
+    `${apiBase}/api/runs/${encodeURIComponent(runId)}/tracks/${encodeURIComponent(trackId)}${qs}`,
+    { cache: "no-cache" }
+  );
+  okOrThrow(r, "getTrackDetail");
   return r.json();
 }
