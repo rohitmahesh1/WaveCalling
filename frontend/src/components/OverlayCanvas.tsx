@@ -14,7 +14,6 @@ export type OverlayCanvasProps = {
   /** Inline style for the canvas wrapper. */
   style?: React.CSSProperties;
 
-  /** Advanced viewer: optional interactivity & customization */
   onPointerMove?: (p: { canvasX: number; canvasY: number; dataX: number; dataY: number }) => void;
   onPointerLeave?: () => void;
   onClickTrack?: (track: Track | null) => void;
