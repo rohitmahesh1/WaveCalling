@@ -11,6 +11,10 @@ interface Props {
   onChange: (partial: Partial<ViewerOptions>) => void;
   onRefresh: () => void;
   loading?: boolean;
+
+  /** Optional: show an “Advanced” action if provided */
+  onOpenAdvanced?: () => void;
+  advancedLabel?: string;
 }
 
 export default function ViewerToolbar({
@@ -18,9 +22,12 @@ export default function ViewerToolbar({
   onChange,
   onRefresh,
   loading,
+  onOpenAdvanced,
+  advancedLabel = "Advanced",
 }: Props) {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-3">
+      {/* Show base toggle */}
       <label className="inline-flex items-center gap-2 text-sm text-slate-300">
         <input
           type="checkbox"
@@ -30,13 +37,16 @@ export default function ViewerToolbar({
         Show base
       </label>
 
-      <div className="inline-flex items-center gap-1 text-sm">
+      {/* Time direction selector */}
+      <div className="inline-flex items-center gap-2 text-sm">
         <span className="text-slate-300">Time</span>
         <select
           className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600"
           value={options.timeDirection}
           onChange={(e) =>
-            onChange({ timeDirection: e.target.value as ViewerOptions["timeDirection"] })
+            onChange({
+              timeDirection: e.target.value as ViewerOptions["timeDirection"],
+            })
           }
         >
           <option value="down">↓ down</option>
@@ -44,13 +54,16 @@ export default function ViewerToolbar({
         </select>
       </div>
 
-      <div className="inline-flex items-center gap-1 text-sm">
+      {/* Color mode selector */}
+      <div className="inline-flex items-center gap-2 text-sm">
         <span className="text-slate-300">Color by</span>
         <select
           className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600"
           value={options.colorBy}
           onChange={(e) =>
-            onChange({ colorBy: e.target.value as ViewerOptions["colorBy"] })
+            onChange({
+              colorBy: e.target.value as ViewerOptions["colorBy"],
+            })
           }
         >
           <option value="none">none</option>
@@ -59,6 +72,17 @@ export default function ViewerToolbar({
         </select>
       </div>
 
+      {/* Optional advanced action */}
+      {onOpenAdvanced && (
+        <button
+          onClick={onOpenAdvanced}
+          className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
+        >
+          {advancedLabel}
+        </button>
+      )}
+
+      {/* Refresh action */}
       <button
         onClick={onRefresh}
         disabled={loading}
