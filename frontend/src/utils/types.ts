@@ -98,6 +98,40 @@ export interface ProgressResponse {
   source: "file" | "synthesized";
 }
 
+export interface RegressionInfo {
+  method: string;                      // e.g. "ransac_poly"
+  degree?: number | null;              // polynomial degree if applicable
+  params?: Record<string, any> | null; // RANSAC kwargs, etc.
+}
+
+export interface OverlayTrackMetrics {
+  dominant_frequency: number;
+  period: number;
+  num_peaks: number;
+  mean_amplitude: number;
+}
+
+export interface OverlayTrack {
+  id: string;
+  sample: string;
+  poly: [number, number][];            // [[y,x], ...]
+  peaks: number[];
+  metrics: OverlayTrackMetrics;
+
+  regression?: RegressionInfo | null;
+  baseline?: (number | null)[];
+  residual?: (number | null)[];
+  sine_fit?: (number | null)[] | null; // only if you choose to return it
+}
+
+export interface OverlayPayload {
+  version: number;
+  tracks: OverlayTrack[];
+}
+
+export type Track = OverlayTrack;
+export type TrackDetailResponse = OverlayTrack;
+
 /** Tracks listing (for download / per-track actions) */
 export type TracksListItem = { id: string; url: string };
 export type TracksListResponse = { count: number; tracks: TracksListItem[] };
