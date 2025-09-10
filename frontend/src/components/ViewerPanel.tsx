@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useNavigate } from "react-router-dom";
 import type { OverlayPayload } from "@/utils/types";
 import ViewerToolbar, { ViewerOptions } from "@/components/ViewerToolbar";
 import OverlayCanvas from "@/components/OverlayCanvas";
@@ -45,6 +46,7 @@ export default function ViewerPanel({
   loading,
   onRefresh,
 }: Props) {
+  const navigate = useNavigate();
   const hasOverlay = !!overlay && (overlay.tracks?.length || 0) > 0;
 
   const statusNode = (() => {
@@ -76,6 +78,9 @@ export default function ViewerPanel({
           onChange={onOptionsChange}
           onRefresh={onRefresh}
           loading={loading}
+          // NEW: expose “Advanced” navigation if route exists
+          onOpenAdvanced={() => navigate("/viewer/advanced")}
+          advancedLabel="Advanced"
         />
       </div>
 
@@ -104,6 +109,7 @@ export default function ViewerPanel({
           padding={20}
           style={{ height: "min(70vh, 720px)" }}
           className="mt-3"
+          // advanced props are optional; basic panel leaves them out
         />
       ) : (
         <EmptyOverlay loading={loading} onRefresh={onRefresh} />
