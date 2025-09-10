@@ -2,9 +2,16 @@
 from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
+import math
 import os
 
 import aiofiles
+import numpy as np
+
+from ..signal.detrend import fit_baseline_ransac
+from ..signal.peaks import detect_peaks
+from ..signal.period import estimate_dominant_frequency, frequency_to_period
+from ..visualize import _fit_global_sine
 
 from ..utils import load_config
 # Ensure headless plotting in worker threads (must be set BEFORE any Matplotlib import anywhere)
@@ -28,7 +35,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 # Pipeline generator (emits JobEvent)
-from .pipeline import iter_run_project, JobEvent
+from .pipeline import _sample_name_from_arr_path, iter_run_project, JobEvent
 
 # ---- Config ----
 APP_ROOT = Path(__file__).resolve().parents[2]  # repo root
@@ -905,6 +912,214 @@ async def delete_run(run_id: str, force: int = Query(0, description="1 = cancel 
 
     _RUNS.pop(run_id, None)
     return {"deleted": run_id}
+
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Inf with None; convert numpy scalars to python."""
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(x) for x in obj]
+    return obj
+
+def _sample_name_from_arr_path(arr_path: Path) -> str:
+    base = arr_path.parent.parent.name
+    return base[:-8] if base.endswith("_heatmap") else base
+
+def _parse_index_range(spec: Optional[str], n: int) -> Optional[Tuple[int, int]]:
+    """
+    Parse 'lo:hi' (inclusive) into clamped indices. Either side may be blank.
+    Examples: '100:300', '200:', ':500'.
+    Returns None if spec is falsy.
+    """
+    if not spec:
+        return None
+    try:
+        lo_s, hi_s = (spec.split(":", 1) + [""])[:2]
+        lo = int(lo_s) if lo_s.strip() else 0
+        hi = int(hi_s) if hi_s.strip() else (n - 1)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid range format; expected 'lo:hi'")
+    lo = max(0, min(n - 1, lo))
+    hi = max(0, min(n - 1, hi))
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+def _lookup_metrics_freq(run_dir: Path, track_id: str | int) -> Optional[float]:
+    """Try to pull dominant_frequency from overlay/tracks.json."""
+    try:
+        overlay = run_dir / "overlay" / "tracks.json"
+        if not overlay.exists():
+            return None
+        with overlay.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        tid = str(track_id)
+        for t in payload.get("tracks", []):
+            if str(t.get("id")) == tid:
+                fval = t.get("metrics", {}).get("dominant_frequency")
+                if fval is None:
+                    return None
+                fval = float(fval)
+                return fval if math.isfinite(fval) and fval > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+@app.get("/api/runs/{run_id}/tracks/{track_id}")
+def get_track_detail(
+    run_id: str,
+    track_id: str,
+    include_sine: bool = Query(False, description="Include phase-anchored sine overlay (baseline + fitted residual)."),
+    include_residual: bool = Query(False, description="Include residual array (position - baseline)."),
+    index_range: Optional[str] = Query(None, alias="range", description="Optional index window 'lo:hi' (inclusive)."),
+    freq_source: Literal["auto", "metrics"] = Query("auto", description="Use 'auto' (recompute) or 'metrics' (overlay) frequency."),
+):
+    """
+    Return exact analysis (parity with CLI):
+      • Baseline from RANSAC polynomial (same degree/kwargs as config)
+      • Residual = position - baseline (optional)
+      • Optional phase-anchored sine overlay (anchored at strongest residual peak)
+      • Explicit time_index and coordinate metadata
+    Arrays align 1:1 with the original .npy order (poly[i] = [y_row, x_pos]).
+
+    If `range=lo:hi` is provided, arrays are sliced and we return:
+      - `slice: {lo, hi}`
+      - `peaks_in_slice` = peak indices that fall inside the window
+    """
+    run_dir = RUNS_ROOT / run_id
+    cfg_path = run_dir / "config.yaml"
+    if not cfg_path.exists():
+        raise HTTPException(status_code=404, detail="config.yaml not found for run")
+
+    cfg = load_config(cfg_path)
+
+    # Locate the .npy for this track id
+    npy: Optional[Path] = None
+    for p in run_dir.rglob(f"{track_id}.npy"):
+        npy = p
+        break
+    if npy is None:
+        raise HTTPException(status_code=404, detail="track not found")
+
+    # ----- Load data -----
+    xy = np.load(npy)  # shape (N,2), [[y,row],[x,col]]
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise HTTPException(status_code=500, detail="Invalid track array shape")
+    time_index = xy[:, 0].astype(float)   # rows (time)
+    position = xy[:, 1].astype(float)     # cols (position)
+    N = len(time_index)
+
+    # ----- Config -----
+    detrend_cfg = (cfg.get("detrend") or {}).copy()
+    degree = int(detrend_cfg.pop("degree", 1))
+    peaks_cfg = cfg.get("peaks", {}) or {}
+    period_cfg = (cfg.get("period", {}) or {}).copy()
+    io_cfg = cfg.get("io", {}) or {}
+    sampling_rate = float(io_cfg.get("sampling_rate", period_cfg.get("sampling_rate", 1.0)))
+    period_cfg.setdefault("sampling_rate", sampling_rate)
+
+    # ----- Baseline via RANSAC (parity with CLI) -----
+    # Regress position ~ poly(time_index) with RANSAC
+    model = fit_baseline_ransac(time_index, position, degree=degree, **detrend_cfg)
+    baseline_pos = model.predict(time_index.reshape(-1, 1)).astype(float)
+    residual_pos = (position - baseline_pos).astype(float)
+
+    # ----- Peaks -----
+    peaks_idx, _ = detect_peaks(residual_pos, **peaks_cfg)
+    peaks_idx = peaks_idx.astype(int) if hasattr(peaks_idx, "astype") else np.asarray(peaks_idx, dtype=int)
+
+    # ----- Frequency / period -----
+    if freq_source == "metrics":
+        freq = _lookup_metrics_freq(run_dir, track_id) or float("nan")
+        if not (isinstance(freq, float) and math.isfinite(freq) and freq > 0):
+            # fallback to computed if metrics missing/invalid
+            try:
+                freq = float(estimate_dominant_frequency(residual_pos, **period_cfg))
+            except Exception:
+                freq = float("nan")
+    else:
+        try:
+            freq = float(estimate_dominant_frequency(residual_pos, **period_cfg))
+        except Exception:
+            freq = float("nan")
+
+    period = float(frequency_to_period(freq)) if (isinstance(freq, float) and math.isfinite(freq) and freq > 0) else float("nan")
+
+    # Strongest residual peak for phase anchoring
+    strongest_peak_idx: Optional[int] = None
+    if peaks_idx.size > 0:
+        try:
+            strongest_peak_idx = int(peaks_idx[int(np.argmax(residual_pos[peaks_idx]))])
+        except Exception:
+            strongest_peak_idx = int(peaks_idx[0])
+
+    # ----- Optional phase-anchored sine overlay -----
+    sine_fit_pos: Optional[np.ndarray] = None
+    if include_sine and math.isfinite(freq) and freq > 0:
+        yfit_res, A, phi, c = _fit_global_sine(
+            residual_pos, time_index, sampling_rate, freq, center_peak_idx=strongest_peak_idx
+        )
+        if yfit_res is not None:
+            sine_fit_pos = (baseline_pos + yfit_res).astype(float)
+
+    # ----- Optional slicing -----
+    lo, hi = 0, N - 1
+    if index_range:
+        lo, hi = _parse_index_range(index_range, N)  # may raise 400
+        time_index_view = time_index[lo : hi + 1]
+        baseline_view = baseline_pos[lo : hi + 1]
+        residual_view = residual_pos[lo : hi + 1] if include_residual else None
+        sine_view = sine_fit_pos[lo : hi + 1] if sine_fit_pos is not None else None
+        peaks_in_slice: List[int] = [int(i) for i in peaks_idx.tolist() if lo <= int(i) <= hi]
+    else:
+        time_index_view = time_index
+        baseline_view = baseline_pos
+        residual_view = residual_pos if include_residual else None
+        sine_view = sine_fit_pos
+        peaks_in_slice = peaks_idx.tolist()
+
+    # ----- Metrics (same definition as pipeline) -----
+    if peaks_idx.size > 0:
+        try:
+            mean_amp = float(residual_pos[peaks_idx].mean())
+        except Exception:
+            mean_amp = float("nan")
+    else:
+        mean_amp = float("nan")
+
+    out = {
+        "id": str(track_id),
+        "sample": _sample_name_from_arr_path(npy),
+        "coords": {"poly_format": "[y, x]", "x_name": "position_px", "y_name": "time_row"},
+        "time_index": time_index_view.tolist(),           # time rows aligned to array indices
+        "baseline": baseline_view.tolist(),               # predicted position per index
+        "residual": (residual_view.tolist() if residual_view is not None else None),
+        "sine_fit": (sine_view.tolist() if sine_view is not None else None),
+        "regression": {
+            "method": "ransac_poly",
+            "degree": degree,
+            "params": detrend_cfg,                        # kwargs used (sans degree)
+        },
+        "peaks": [int(i) for i in peaks_idx.tolist()],
+        "peaks_in_slice": [int(i) for i in peaks_in_slice],
+        "strongest_peak_idx": strongest_peak_idx,
+        "metrics": {
+            "dominant_frequency": freq if math.isfinite(freq) else None,
+            "period": period if math.isfinite(period) else None,
+            "num_peaks": int(len(peaks_idx)),
+            "mean_amplitude": mean_amp if math.isfinite(mean_amp) else None,
+        },
+    }
+    if index_range:
+        out["slice"] = {"lo": lo, "hi": hi}
+
+    return _sanitize_for_json(out)
     
 
 # Dev convenience: run with `python -m src.service.api`
