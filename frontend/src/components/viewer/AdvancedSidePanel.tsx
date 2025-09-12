@@ -121,7 +121,7 @@ export default function AdvancedSidePanel({
   }, [selectedTrack]);
 
   return (
-    <div className="flex flex-col gap-4 min-w-[500px]">
+    <div className="flex flex-col gap-4 min-w-[360px]">
       {/* Downloads */}
       <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
         <div className="flex items-center justify-between gap-2 flex-wrap">
