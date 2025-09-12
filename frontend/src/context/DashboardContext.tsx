@@ -41,7 +41,8 @@ type Ctx = {
   overlaySummary: { tracks: number; points: number } | null;
   overlayLoading: boolean;
   baseImageUrl: string | null;
-  refreshOverlay: () => Promise<void>;
+  /** Returns true iff the overlay actually changed (cheap signature check). */
+  refreshOverlay: (opts?: { force?: boolean }) => Promise<boolean>;
 
   progress: ProgressResponse | null;
   refreshProgress: () => Promise<void>;
@@ -155,7 +156,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
 
   // --- viewer options ---
   const [viewerOptions, _setViewerOptions] = React.useState<ViewerOptions>({
-    timeDirection: "down",
+    timeDirection: "up",
     colorBy: "none",
     showBase: true,
   });
@@ -174,16 +175,20 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     baseImageUrl,
     overlayLoading,
     overlaySummary,
-    refreshOverlay,
+    // NOTE: hook returns Promise<boolean> (true = overlay changed)
+    refreshOverlay: refreshOverlayRaw,
   } = useOverlay(safeRunId);
 
   const { progress, refreshProgress } = useProgress(safeRunId);
 
-  // When overlay refresh succeeds, also refresh info/artifacts (cheap and in-memory)
-  const refreshOverlayChained = React.useCallback(async () => {
-    await refreshOverlay();
-    await refreshInfo();
-  }, [refreshOverlay, refreshInfo]);
+  // When overlay refresh *changes*, also refresh info/artifacts (cheap and in-memory)
+  const refreshOverlay = React.useCallback(async (opts?: { force?: boolean }) => {
+    const changed = await refreshOverlayRaw(opts);
+    if (changed) {
+      try { await refreshInfo(); } catch {}
+    }
+    return changed;
+  }, [refreshOverlayRaw, refreshInfo]);
 
   const value: Ctx = {
     selectedRunId,
@@ -200,7 +205,7 @@ export function DashboardProvider({ children }: { children: React.ReactNode }) {
     overlaySummary,
     overlayLoading,
     baseImageUrl,
-    refreshOverlay: refreshOverlayChained,
+    refreshOverlay,
 
     progress,
     refreshProgress,
