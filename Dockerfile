@@ -28,5 +28,5 @@ COPY --from=frontend-build /app/frontend/dist ./web
 ENV WEB_DIR=/app/web
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8000
+EXPOSE 800
 CMD ["python", "-m", "src.service.api"]
