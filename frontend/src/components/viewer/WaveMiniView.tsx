@@ -10,7 +10,7 @@ export type WaveMiniViewOptions = {
   showBaseline?: boolean;
   showSineFit?: boolean;
   showPeaks?: boolean;
-  showBase?: boolean;
+  showBase?: boolean;            // default: false (kept this default)
   invertY?: boolean;
   requestIncludeResidual?: boolean;
   initialWindow?: "full" | "peak";
@@ -28,9 +28,9 @@ type Props = {
 type TrackDetailResponse = {
   id: string | number;
   time_index?: number[];
-  baseline?: number[];  // x per index
+  baseline?: number[];   // x per index
   residual?: number[];
-  sine_fit?: number[];  // baseline + phase-anchored sine (x per index)
+  sine_fit?: number[];   // baseline + phase-anchored sine (x per index)
   regression?: { method?: string; degree?: number; params?: Record<string, any> };
 };
 
@@ -54,8 +54,22 @@ function niceTicks(min: number, max: number, maxTicks: number): number[] {
                10 * pow10;
   const t0 = Math.ceil(min / step) * step;
   const arr: number[] = [];
-  for (let v = t0; v <= max + 1e-9; v += step) arr.push(v);
+  for (let v = t0; v <= max + 1e-9; v += step) arr.push(Number(v.toFixed(12)));
   return arr.slice(0, Math.max(2, maxTicks + 1));
+}
+
+function formatTick(val: number, stepGuess?: number) {
+  const s = Math.abs(stepGuess ?? 0);
+  let decimals = 0;
+  if (s > 0 && s < 1) {
+    if (s >= 0.5) decimals = 1;
+    else if (s >= 0.1) decimals = 1;
+    else if (s >= 0.05) decimals = 2;
+    else if (s >= 0.01) decimals = 2;
+    else decimals = 3;
+  }
+  if (!isFinite(val)) return "";
+  return val.toFixed(decimals);
 }
 
 export default function WaveMiniView({ track, className, baseImageUrl: baseUrlProp, options }: Props) {
@@ -65,33 +79,27 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
   const resolvedBaseUrl = baseUrlProp ?? baseUrlCtx ?? undefined;
   const resolvedInvertY = options?.invertY ?? (viewerOptions.timeDirection === "up");
 
-  // ---- Persisted UI state ----
+  // ---- Persisted UI state (Base image is OFF by default) ----
   type Prefs = {
     showAxes: boolean;
     showBaseline: boolean;
     showSineFit: boolean;
     showPeaks: boolean;
-    showBase: boolean;
+    showBase: boolean;         // default false
     mode: "full" | "peak";
     windowPts: number;
   };
-  const [prefs, setPrefs] = useLocalStorage<Prefs>("wmv:prefs:v1", {
+  const [prefs, setPrefs] = useLocalStorage<Prefs>("wmv:prefs:v2", {
     showAxes: options?.showAxes ?? true,
     showBaseline: options?.showBaseline ?? true,
     showSineFit: options?.showSineFit ?? false,
     showPeaks: options?.showPeaks ?? true,
-    showBase: options?.showBase ?? false,
+    showBase: options?.showBase ?? false,     // <-- disabled by default
     mode: options?.initialWindow ?? "peak",
     windowPts: options?.initialWindowPts ?? 120,
   });
 
-  const showAxes = prefs.showAxes;
-  const showBaseline = prefs.showBaseline;
-  const showSineFit = prefs.showSineFit;
-  const showPeaks = prefs.showPeaks;
-  const showBase = prefs.showBase;
-  const mode = prefs.mode;
-  const windowPts = prefs.windowPts;
+  const { showAxes, showBaseline, showSineFit, showPeaks, showBase, mode, windowPts } = prefs;
 
   // Canvas + image + auto height
   const wrapRef = React.useRef<HTMLDivElement | null>(null);
@@ -110,7 +118,7 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
     const im = new Image();
     im.crossOrigin = "anonymous";
     const u = new URL(resolvedBaseUrl, window.location.origin);
-    u.searchParams.set("t", Date.now().toString());
+    u.searchParams.set("t", Date.now().toString()); // cache bust for dev
     im.onload = () => { if (!cancelled) setImg(im); };
     im.onerror = () => { if (!cancelled) setImg(null); };
     im.src = u.toString();
@@ -164,7 +172,7 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
     setAutoHeight(h);
   }, [windowBounds]);
 
-  // Fetch baseline/sine/residual as needed; endpoint matches refactored FastAPI
+  // Fetch baseline/sine/residual as needed
   React.useEffect(() => {
     const need = showBaseline || showSineFit || options?.requestIncludeResidual;
     if (!need) { setDetail(null); return; }
@@ -247,20 +255,107 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
       return { cx: offX + (x - minX) * scale, cy: offY + yNorm * scale };
     };
 
-    // Base image
+    // Base image — crop to current window so we don't draw the whole image
     if (showBase && img) {
+      // Window in data/image coords
+      const sx = Math.max(0, Math.floor(minX));
+      const syUp = Math.max(0, Math.floor(minY));
+      const sw = Math.max(1, Math.min(img.naturalWidth  - sx, Math.ceil(spanX)));
+      const sh = Math.max(1, Math.min(img.naturalHeight - syUp, Math.ceil(spanY)));
+
+      // Image pixels are addressed from top-left; our minY is from bottom.
+      const syTL = img.naturalHeight - (syUp + sh);
+
+      // Destination is exactly the letterboxed content box for this window
+      const dx = offX;
+      const dy = offY;
+      const dw = effW;
+      const dh = effH;
+
       ctx.save();
-      ctx.translate(offX, offY);
-      ctx.scale(scale, scale);
-      if (resolvedInvertY) { ctx.translate(-minX, -maxY); ctx.scale(1, -1); }
-      else { ctx.translate(-minX, -minY); }
       ctx.globalAlpha = 0.65;
-      ctx.drawImage(img, 0, 0);
-      ctx.globalAlpha = 1;
+      // draw the cropped patch stretched to fill the content box
+      ctx.drawImage(img, sx, syTL, sw, sh, dx, dy, dw, dh);
       ctx.restore();
     }
 
-    // Raw track
+    // ---- Nice axes (grid inside plot area) ----
+    if (showAxes) {
+      // Border of plot area (crisp at 0.5)
+      ctx.strokeStyle = "#2a3140";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.rect(Math.floor(offX) + 0.5, Math.floor(offY) + 0.5, Math.floor(effW) - 1 + 1, Math.floor(effH) - 1 + 1);
+      ctx.stroke();
+
+      // Ticks & grid
+      const maxXTicks = clamp(Math.floor(effW / 80), 2, 8);
+      const maxYTicks = clamp(Math.floor(effH / 60), 2, 8);
+      const xt = niceTicks(minX, maxX, maxXTicks);
+      const yt = niceTicks(minY, maxY, maxYTicks);
+      const xStep = xt.length >= 2 ? Math.abs(xt[1] - xt[0]) : undefined;
+      const yStep = yt.length >= 2 ? Math.abs(yt[1] - yt[0]) : undefined;
+
+      // Grid lines (dashed, subtle)
+      ctx.save();
+      ctx.setLineDash([3, 4]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(148,163,184,0.16)"; // slate-400 @ ~16%
+
+      // verticals
+      for (const tx of xt) {
+        const cx = offX + (tx - minX) * scale + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(cx, offY);
+        ctx.lineTo(cx, offY + effH);
+        ctx.stroke();
+      }
+      // horizontals
+      for (const ty of yt) {
+        const cy = offY + (resolvedInvertY ? (maxY - ty) * scale : (ty - minY) * scale) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(offX, cy);
+        ctx.lineTo(offX + effW, cy);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Tick labels
+      ctx.fillStyle = "#9aa4bf";
+      ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+
+      // X along bottom
+      const baseY = Math.floor(offY + effH) + 0.5;
+      for (const tx of xt) {
+        const cx = offX + (tx - minX) * scale;
+        // minor tick mark
+        ctx.strokeStyle = "#475569";
+        ctx.beginPath();
+        ctx.moveTo(Math.floor(cx) + 0.5, baseY);
+        ctx.lineTo(Math.floor(cx) + 0.5, baseY + 4);
+        ctx.stroke();
+
+        const s = formatTick(tx, xStep);
+        const tw = ctx.measureText(s).width;
+        ctx.fillText(s, cx - tw / 2, baseY + 14);
+      }
+
+      // Y along left
+      for (const ty of yt) {
+        const cy = offY + (resolvedInvertY ? (maxY - ty) * scale : (ty - minY) * scale);
+        ctx.strokeStyle = "#475569";
+        ctx.beginPath();
+        ctx.moveTo(Math.floor(offX) - 0.5, Math.floor(cy) + 0.5);
+        ctx.lineTo(Math.floor(offX) + 3.5, Math.floor(cy) + 0.5);
+        ctx.stroke();
+
+        const s = formatTick(ty, yStep);
+        const tw = ctx.measureText(s).width;
+        ctx.fillText(s, Math.max(4, offX - 6 - tw), cy - 2);
+      }
+    }
+
+    // ---- Track polyline ----
     ctx.lineWidth = 1.4;
     ctx.strokeStyle = "rgba(80, 200, 120, 0.95)";
     ctx.beginPath();
@@ -284,7 +379,7 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
       }
     }
 
-    // Overlays
+    // Baseline / Sine fit overlay
     if ((showBaseline || showSineFit) && detail) {
       const series = showSineFit && detail.sine_fit ? detail.sine_fit : detail.baseline;
       if (Array.isArray(series) && series.length >= pts.length) {
@@ -298,40 +393,6 @@ export default function WaveMiniView({ track, className, baseImageUrl: baseUrlPr
           ctx.lineTo(c.cx, c.cy);
         }
         ctx.stroke();
-      }
-    }
-
-    // Axes (nice ticks, outside the box)
-    if (showAxes) {
-      ctx.strokeStyle = "#344053";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(0.5, 0.5, cssW - 1, cssH - 1);
-
-      ctx.fillStyle = "#9aa4bf";
-      ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-
-      const maxXTicks = clamp(Math.floor(effW / 80), 2, 8);
-      const maxYTicks = clamp(Math.floor(effH / 60), 2, 8);
-      const xt = niceTicks(minX, maxX, maxXTicks);
-      const yt = niceTicks(minY, maxY, maxYTicks);
-
-      // X ticks along bottom of effective box
-      const baseY = offY + effH;
-      for (const tx of xt) {
-        const cx = offX + (tx - minX) * scale;
-        ctx.beginPath(); ctx.moveTo(cx, baseY); ctx.lineTo(cx, baseY + 4); ctx.stroke();
-        const s = Math.round(tx).toString();
-        const tw = ctx.measureText(s).width;
-        ctx.fillText(s, cx - tw / 2, baseY + 14);
-      }
-
-      // Y ticks along left of effective box
-      for (const ty of yt) {
-        const cy = offY + (resolvedInvertY ? (maxY - ty) * scale : (ty - minY) * scale);
-        ctx.beginPath(); ctx.moveTo(offX - 4, cy); ctx.lineTo(offX, cy); ctx.stroke();
-        const s = Math.round(ty).toString();
-        const tw = ctx.measureText(s).width;
-        ctx.fillText(s, Math.max(4, offX - 6 - tw), cy - 2);
       }
     }
 
