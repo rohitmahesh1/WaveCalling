@@ -19,6 +19,80 @@ from .kymobutler_pt import (
 from .tracker import CrossingTracker, Track, enforce_one_point_per_row
 
 
+# ======================================================
+# New: Morphology helpers (WL "classic" + directional)
+# ======================================================
+
+def _to_cv(mask01: np.ndarray) -> np.ndarray:
+    """0/1 -> 0/255 uint8 for OpenCV morphology."""
+    return (mask01.astype(np.uint8) * 255)
+
+def _from_cv(mask255: np.ndarray) -> np.ndarray:
+    """0/255 -> 0/1 uint8."""
+    return (mask255 > 0).astype(np.uint8)
+
+def morph_classic(mask01: np.ndarray, k: int = 3) -> np.ndarray:
+    """WL-like SmoothBin: close -> open -> close with 3x3 ellipse."""
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(k), int(k)))
+    m = _to_cv(mask01)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, se, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  se, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, se, iterations=1)
+    return _from_cv(m)
+
+def morph_directional(mask01: np.ndarray, kv: int, kh: int, diag_bridge: bool) -> np.ndarray:
+    """Anisotropic vertical+horizontal close; optional gentle 3x3 diagonal bridge."""
+    m = _to_cv(mask01)
+    v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(kv))))
+    h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(kh)), 1))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, v, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, h, iterations=1)
+    if diag_bridge:
+        d = np.ones((3, 3), np.uint8)  # gentle 3x3 bridge
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, d, iterations=1)
+    return _from_cv(m)
+
+def weak_only_shave(mask01: np.ndarray, prob: np.ndarray, p_shave: float = 0.12) -> np.ndarray:
+    """
+    Open only the low-confidence pixels (prob < p_shave) with tiny (1x3, 3x1) kernels,
+    then merge back with strong pixels. Shaves whiskers; preserves strong ridges.
+    """
+    weak = (prob < float(p_shave))
+    m = mask01.astype(bool)
+    sub = (m & weak).astype(np.uint8) * 255
+    k1 = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+    sub = cv2.morphologyEx(sub, cv2.MORPH_OPEN, k1, iterations=1)
+    sub = cv2.morphologyEx(sub, cv2.MORPH_OPEN, k2, iterations=1)
+    m_weak = (sub > 0)
+    m_strong = m & (~weak)
+    return (m_weak | m_strong).astype(np.uint8)
+
+def apply_morphology(
+    mask01: np.ndarray,
+    prob: np.ndarray,
+    *,
+    mode: str = "classic",          # "classic" | "directional" | "none"
+    classic_kernel: int = 3,
+    dir_kv: int = 4,
+    dir_kh: int = 3,
+    diag_bridge: bool = True,
+    weak_shave_enable: bool = True,
+    p_shave: float = 0.12,
+) -> np.ndarray:
+    """Router to classic/directional morphology with optional weak-only shave."""
+    mode = (mode or "classic").lower()
+    if mode == "none":
+        m = mask01
+    elif mode == "classic":
+        m = morph_classic(mask01, k=int(classic_kernel))
+    else:
+        m = morph_directional(mask01, kv=int(dir_kv), kh=int(dir_kh), diag_bridge=bool(diag_bridge))
+        if weak_shave_enable:
+            m = weak_only_shave(m, prob, p_shave=float(p_shave))
+    return m
+
+
 # ---------------------------
 # Small helpers
 # ---------------------------
@@ -190,6 +264,120 @@ def _junction_nms(skel: np.ndarray, prob: np.ndarray) -> np.ndarray:
             keep[y, x] = 0
     return keep
 
+def _spur_prune_by_prob(skel: np.ndarray, prob: np.ndarray, L: int = 10, p_min: float = 0.13) -> np.ndarray:
+    """
+    Remove leaf branches up to length L whose mean probability < p_min.
+    Confidence-guided variant that preserves strong terminals.
+    """
+    S = skel.copy().astype(np.uint8)
+    H, W = S.shape
+    changed = True
+    while changed:
+        changed = False
+        deg = _degree_map(S)
+        ys, xs = np.where((S == 1) & (deg == 1))
+        for y0, x0 in zip(ys, xs):
+            path = [(y0, x0)]
+            py, px = -1, -1
+            y, x = y0, x0
+            for _ in range(L):
+                nbrs = [(ny, nx) for ny, nx in _neighbors8(y, x, H, W) if S[ny, nx] == 1 and (ny, nx) != (py, px)]
+                if len(nbrs) != 1:
+                    break
+                py, px = y, x
+                y, x = nbrs[0]
+                path.append((y, x))
+            vals = [prob[yy, xx] for (yy, xx) in path]
+            if len(path) <= L and (np.mean(vals) < p_min):
+                for (yy, xx) in path:
+                    S[yy, xx] = 0
+                changed = True
+    return S
+
+def _endpoints(skel: np.ndarray) -> List[Tuple[int,int]]:
+    H, W = skel.shape
+    out = []
+    for y, x in zip(*np.where(skel == 1)):
+        deg = 0
+        for dy, dx in _OFFSETS_8:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < H and 0 <= nx < W and skel[ny, nx] == 1:
+                deg += 1
+        if deg == 1:
+            out.append((y, x))
+    return out
+
+def _bresenham(y0, x0, y1, x1):
+    """Integer line coords from (y0,x0) to (y1,x1)."""
+    pts = []
+    dy = abs(y1 - y0); dx = abs(x1 - x0)
+    sy = 1 if y0 < y1 else -1
+    sx = 1 if x0 < x1 else -1
+    err = (dy - dx)
+    while True:
+        pts.append((y0, x0))
+        if y0 == y1 and x0 == x1: break
+        e2 = 2 * err
+        if e2 > -dx: err -= dx; y0 += sy
+        if e2 <  dy: err += dy; x0 += sx
+    return pts
+
+def _bridge_skeleton_gaps(
+    skel: np.ndarray,
+    prob: np.ndarray,
+    *,
+    max_gap_rows: int = 18,
+    max_dx: int = 7,
+    prob_min: float = 0.11,
+    max_bridges: int = 2000
+) -> np.ndarray:
+    """
+    Connect pairs of endpoints if:
+      - 0 < Δy ≤ max_gap_rows
+      - |Δx| ≤ max_dx
+      - mean(prob) along straight line ≥ prob_min
+      - line passes mostly through empty skeleton
+    Then re-thin to 1 px.
+    """
+    H, W = skel.shape
+    eps = 1e-6
+    ends = _endpoints(skel)
+    if not ends: return skel
+
+    # bucket endpoints by row for quick lookups
+    by_row: Dict[int, List[Tuple[int,int]]] = {}
+    for y, x in ends:
+        by_row.setdefault(y, []).append((y, x))
+
+    bridges = 0
+    sk = skel.copy().astype(np.uint8)
+
+    for y0, x0 in sorted(ends):
+        for dy in range(1, max_gap_rows + 1):
+            y1 = y0 + dy
+            if y1 >= H or y1 not in by_row: break
+            # search candidates near x0
+            for (yy, xx) in by_row[y1]:
+                if abs(xx - x0) > max_dx: continue
+                pts = _bresenham(y0, x0, yy, xx)
+                yyv, xxv = zip(*pts)
+                # require the path to cross mostly empty skeleton
+                if sk[yyv, xxv].mean() > 0.25:  # already occupied → likely same component
+                    continue
+                pmean = float(prob[yyv, xxv].mean()) if pts else 0.0
+                if pmean < prob_min: continue
+                sk[yyv, xxv] = 1
+                bridges += 1
+                if bridges >= max_bridges:
+                    break
+            if bridges >= max_bridges:
+                break
+        if bridges >= max_bridges:
+            break
+
+    # keep skeleton 1-px thin
+    sk = _thin(sk.astype(bool)).astype(np.uint8)
+    return sk
 
 # ---------------------------
 # Track refinement (extend + merge)
@@ -324,7 +512,7 @@ def run_kymobutler(
     thr_bi: Optional[float] = None,
 
     # WL-ish cleaning knobs
-    morph_close_open_close: bool = False,
+    morph_close_open_close: bool = False,       # if True => classic mode
     comp_min_px: int = 10,
     comp_min_rows: int = 10,
     prune_iters: int = 2,
@@ -339,12 +527,14 @@ def run_kymobutler(
     hysteresis_enable: bool = True,
     hysteresis_low: float = 0.10,
     hysteresis_high: float = 0.20,
-    directional_close: bool = True,
+    directional_close: bool = True,            # if True (and not classic) => directional mode
 
     # directional kernel hints (optional; passed by extract.py if present)
     dir_kv: int = 5,               # vertical kernel height
     dir_kh: int = 5,               # horizontal kernel width
     diag_bridge: bool = True,      # enable diagonal/cross bridging
+    weak_shave_enable: bool = True,# NEW: shave low-prob whiskers after directional bridging
+    weak_shave_p: float = 0.12,    # NEW: probability threshold for weak-only shave
 
     # fusion
     fuse_uni_into_bi: bool = True,
@@ -371,6 +561,9 @@ def run_kymobutler(
     dedupe_min_score: float = 0.11,
     dedupe_overlap_iou: float = 0.80,
     dedupe_dx_tol: float = 2.5,
+
+    # decision network gate (parity-critical)
+    decision_thr: float = 0.50,    # NEW: gate low-confidence branch picks
 
     # debug file outputs
     debug_save_images: bool = True,
@@ -425,7 +618,7 @@ def run_kymobutler(
             prob = prob_bi
         used_thr = float(t_bi)
 
-    # threshold + WL-like shaping
+    # threshold (+ optional hysteresis / auto-threshold)
     mask0 = prob_to_mask(prob, thr=used_thr)  # expected 0/1 uint8
 
     hmask = None
@@ -442,29 +635,16 @@ def run_kymobutler(
         mask0 = prob_to_mask(prob, thr=used_thr)
         pct0 = float(mask0.mean()) * 100.0
 
-    # morphology
-    mask = mask0.copy()
-    if morph_close_open_close:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    else:
-        if directional_close:
-            kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(dir_kv))))
-            kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(dir_kh)), 1))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kv)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kh)
-            if diag_bridge:
-                kdl = np.array([[1, 0, 1],
-                                [0, 1, 0],
-                                [1, 0, 1]], dtype=np.uint8)
-                kcr = np.array([[0, 1, 0],
-                                [1, 1, 1],
-                                [0, 1, 0]], dtype=np.uint8)
-                mask_dl = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kdl)
-                mask_cr = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kcr)
-                mask = np.maximum(mask, np.maximum(mask_dl, mask_cr)).astype(np.uint8)
+    # morphology (WL-parity router)
+    morph_mode = "classic" if morph_close_open_close else ("directional" if directional_close else "none")
+    mask = apply_morphology(
+        mask0, prob,
+        mode=morph_mode,
+        classic_kernel=3,
+        dir_kv=dir_kv, dir_kh=dir_kh, diag_bridge=diag_bridge,
+        weak_shave_enable=bool(weak_shave_enable),
+        p_shave=float(weak_shave_p),
+    )
 
     # component filter prior to skeletonization
     mask_f = filter_components(mask, min_px=comp_min_px, min_rows=comp_min_rows)
@@ -500,14 +680,28 @@ def run_kymobutler(
         if int(skel_nms.sum()) >= MIN_KEEP_PX:
             skel = skel_nms
 
-        for spur_len in [5, 4, 3]:
+        # prune short twigs by length (iterative, conservative)
+        for spur_len in [7, 6, 5]:
             skel_try = _spur_prune_by_len(skel, max_len=spur_len)
             if int(skel_try.sum()) >= MIN_KEEP_PX:
                 skel = skel_try
                 break
 
+        # NEW: probability-aware spur pruning (confidence-gated)
+        skel_prob = _spur_prune_by_prob(skel, prob, L=10, p_min=0.13)
+        if int(skel_prob.sum()) >= MIN_KEEP_PX:
+            skel = skel_prob
+
     if prune_iters > 0:
         skel = prune_endpoints(skel, iterations=prune_iters)
+    
+    skel = _bridge_skeleton_gaps(
+        skel, prob,
+        max_gap_rows=max_gap_rows,
+        max_dx=max_dx,
+        prob_min=prob_bridge_min
+    )
+    
 
     if verbose:
         print("[debug.skel] base_px:", BASE_PX,
@@ -543,6 +737,7 @@ def run_kymobutler(
         max_branch_steps=256,
         min_track_len=max(5, min_length // 3),
         decision_recent_tail=16,
+        decision_thr=float(decision_thr),   # NEW: confidence gate for branch selection
     )
     tracks_seg = tracker.extract_tracks(gray_seg, skel)
 
