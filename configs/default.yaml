@@ -1,9 +1,9 @@
 logging:
-  level: INFO  # DEBUG, INFO, WARNING, ERROR
-  jsonl_events: true            # NEW: write events.ndjson for SSE replay
+  level: INFO
+  jsonl_events: true
 
 io:
-  sampling_rate: &sr 5.0        # anchor for reuse
+  sampling_rate: &sr 5.0
   image_globs: ["*.png", "*.jpg", "*.jpeg"]
   track_glob: "*.npy"
   table_globs: ["*.csv", "*.tsv", "*.xls", "*.xlsx"]
@@ -27,7 +27,7 @@ peaks:
   distance: 8
 
 period:
-  sampling_rate: *sr            # use the same value as io.sampling_rate
+  sampling_rate: *sr
   min_freq: 0.02
   max_freq: 2.0
 
@@ -38,10 +38,10 @@ viz:
     spectrum: true
   summary:
     histograms: true
-  wave_windows:                # NEW: tame explosion of tiny files
-    save: true                 # save per-peak window PNGs
-    max_per_track: 50          # cap count per track
-    stride: 1                  # take every Nth window (1 = keep all)
+  wave_windows:
+    save: true
+    max_per_track: 50
+    stride: 1
   hist_bins: 20
   dpi: 180
 
@@ -52,101 +52,91 @@ features:
     surf_min_deg: 20
     prominence_min_px: 1.0
 
-# ----------------------------------------------------
-# Service / pipeline controls (NEW)
-# ----------------------------------------------------
 service:
-  partial_every_tracks: 250      # write tracks.partial.json every N tracks
-  write_progress_every_secs: 10  # update progress.json cadence
+  partial_every_tracks: 250
+  write_progress_every_secs: 10
   overlay:
     write_every_tracks: 1
     format: ndjson
   resume:
     enabled: true
-    marker_dir: "output/processed"   # per-track .done markers
-    progress_file: "progress.json"   # global progress snapshot
-    safe_skip: true                  # verify outputs before skipping
+    marker_dir: "output/processed"
+    progress_file: "progress.json"
+    safe_skip: true
   retention:
-    enabled: false                   # set true to enable auto-prune
+    enabled: false
     keep_last_runs: 20
-    max_run_age_days: null           # e.g., 14 to age out old runs
+    max_run_age_days: null
   artifacts:
-    write_run_json: true             # persist run.json metadata
-    write_events_ndjson: true        # append events.ndjson for replay
+    write_run_json: true
+    write_events_ndjson: true
 
-# ----------------------------------------------------
-# KymoButler pipeline configuration
-# ----------------------------------------------------
 kymo:
   backend: onnx
 
   onnx:
-    # Model & classification/seg behavior
-    export_dir: null          # null => auto-discover export/
+    export_dir: null
     seg_size: 256
-    force_mode: bi            # "uni" | "bi" | null (null => use classifier)
+    force_mode: bi
     fuse_uni_into_bi: true
-    fuse_uni_weight: 0.7      # 0.6–0.8 works well
+    fuse_uni_weight: 0.6          # ↓ less weight on UNI to reduce fuzzy fill
 
-    # Thresholding
     thresholds:
       thr_default: 0.20
-      thr_bi: 0.18
+      thr_bi: 0.19                # ↑ slightly stricter to thin mask a touch
       thr_uni: 0.20
     auto_threshold:
       enabled: true
-      sweep: [0.12, 0.30, 19]         # [lo, hi, N]
-      target_mask_pct: [15.0, 25.0]   # desired mask density band
-      trigger_pct: [5.0, 35.0]        # only auto-tune if outside this band
+      sweep: [0.12, 0.30, 19]
+      target_mask_pct: [15.0, 25.0]
+      trigger_pct: [5.0, 35.0]
     hysteresis:
       enabled: true
-      low: 0.08
+      low: 0.09                   # ↑ require stronger support for weak pixels
       high: 0.18
 
-    # Mask → skeleton shaping
     morphology:
-      mode: directional        # "directional" | "classic" | "none"
+      mode: directional
       directional:
-        kv: 5                  # vertical close kernel height (1xkv)
-        kh: 5                  # horizontal close kernel width (khx1)
-        diag_bridge: true      # apply 3x3 diagonal bridging close
+        kv: 4                      # ↓ a bit gentler closing to avoid over-bridging
+        kh: 4
+        diag_bridge: false         # ↓ disable diagonal bridging (common source of hair)
       classic:
-        kernel: 3              # 3x3 ellipse; close→open→close
+        kernel: 3
 
     components:
-      min_px: 7                # drop tiny blobs before skeletonization
-      min_rows: 5
+      min_px: 9                    # ↑ drop more tiny blobs
+      min_rows: 7                  # ↑ require taller components
 
     skeleton:
-      method: thin             # "thin" | "zhangsuen"
-      prune_iters: 0
-      keep_ratio: 0.60
-      keep_min_px: 2000
-      prob_floor_min: 0.07     # adapter honors
-      prob_floor_max: 0.10     # adapter honors
+      method: thin
+      prune_iters: 1               # ↑ trim short stubs post-thinning
+      keep_ratio: 0.65             # ↑ protect against over-pruning
+      keep_min_px: 2500            # ↑ absolute floor
+      prob_floor_min: 0.09         # ↑ raise corridor floor to shave wisps
+      prob_floor_max: 0.10
 
-    # Tracking & post-processing
     tracking:
-      min_length: 30
+      min_length: 50
       max_branch_steps: 256
       decision_recent_tail: 16
 
     postproc:
       extend_rows: 22
       dx_win: 4
-      prob_min: 0.11
-      max_gap_rows: 13
-      max_dx: 6
-      prob_bridge_min: 0.11
+      prob_min: 0.12               # ↑ be pickier when extending ends
+      max_gap_rows: 11             # ↓ merge across slightly smaller gaps
+      max_dx: 5                    # ↓ require closer alignment
+      prob_bridge_min: 0.12        # ↑ need stronger bridge evidence
       dedupe:
         enabled: true
         min_rows: 30
-        min_score: 0.11
-        overlap_iou: 0.80
-        dx_tol: 2.5
+        min_score: 0.12            # ↑ remove low-quality dupes
+        overlap_iou: 0.85          # ↑ stricter duplicate definition
+        dx_tol: 2.0                # ↓ tracks must align tighter
 
     debug:
-      save_debug_images: true  # adapter gates file writes on this
+      save_debug_images: true
 
   wolfram:
     scripts_dir: kymobutler_scripts
