@@ -53,7 +53,8 @@ def _resize_hw(img01: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
     return cv2.resize(img01, (w, h), interpolation=cv2.INTER_AREA)
 
 def prob_to_mask(prob: np.ndarray, thr: float = 0.20) -> np.ndarray:
-    return (prob > thr).astype(np.uint8)
+    # Inclusive thresholding (WL-like) to stabilize mask density targeting.
+    return (prob >= float(thr)).astype(np.uint8)
 
 
 # ---------------------------
@@ -188,7 +189,7 @@ def _normlines_like_wl(img01: np.ndarray) -> np.ndarray:
     return out.astype(np.float32, copy=False)
 
 def _preproc_like_wl(img_gray: np.ndarray) -> np.ndarray:
-    """ImageAdjust + ColorConvert + RemoveAlpha handled by caller; we get a gray uint8/float."""
+    """WL-style: grayscale in -> [0,1], optional invert, per-row normalization."""
     x = _to_01_gray(img_gray)
     if _is_negated_like_wl(x):
         x = 1.0 - x
@@ -200,9 +201,6 @@ def _preproc_like_wl(img_gray: np.ndarray) -> np.ndarray:
 # Tiling / blending helpers
 # ---------------------------
 
-def _round_up(v, base):
-    return int(base * math.ceil(float(v) / base))
-
 def _hann1d(n: int) -> np.ndarray:
     # Hann with floor to avoid 0-weight borders (prevents divide-by-zero at edges)
     if n <= 1:
@@ -213,11 +211,33 @@ def _hann1d(n: int) -> np.ndarray:
 def _hann2d(h: int, w: int) -> np.ndarray:
     return np.outer(_hann1d(h), _hann1d(w)).astype(np.float32)
 
-def _ensure_min_hw(img01: np.ndarray, min_h: int, min_w: int) -> np.ndarray:
-    h, w = img01.shape[:2]
-    if h >= min_h and w >= min_w:
-        return img01
-    return cv2.resize(img01, (max(min_w, w), max(min_h, h)), interpolation=cv2.INTER_CUBIC)
+def _pad_to_at_least(img01: np.ndarray, min_h: int, min_w: int) -> tuple[np.ndarray, tuple[int,int,int,int]]:
+    """
+    Pad bottom/right to ensure H>=min_h and W>=min_w. Returns (padded, pads[top,left,bottom,right]).
+    """
+    H, W = img01.shape
+    pad_t = pad_l = 0
+    pad_b = max(0, min_h - H)
+    pad_r = max(0, min_w - W)
+    if pad_b == 0 and pad_r == 0:
+        return img01, (0, 0, 0, 0)
+    img01p = np.pad(img01, ((pad_t, pad_b), (pad_l, pad_r)), mode="edge")
+    return img01p, (pad_t, pad_l, pad_b, pad_r)
+
+def _pad_to_multiple(img01: np.ndarray, multiple: int) -> tuple[np.ndarray, tuple[int,int,int,int]]:
+    """
+    Pad bottom/right so H and W are multiples of 'multiple'. Returns (padded, pads[top,left,bottom,right]).
+    """
+    H, W = img01.shape
+    Hr = int(multiple * math.ceil(H / multiple)) if multiple > 0 else H
+    Wr = int(multiple * math.ceil(W / multiple)) if multiple > 0 else W
+    pad_t = pad_l = 0
+    pad_b = Hr - H
+    pad_r = Wr - W
+    if pad_b == 0 and pad_r == 0:
+        return img01, (0, 0, 0, 0)
+    img01p = np.pad(img01, ((pad_t, pad_b), (pad_l, pad_r)), mode="edge")
+    return img01p, (pad_t, pad_l, pad_b, pad_r)
 
 
 # ---------------------------
@@ -307,7 +327,7 @@ class KymoButlerPT:
     """ORT-based runner for KymoButler ONNX models, with WL-like preprocessing."""
     def __init__(self, export_dir=None, seg_size=256,
                  tile_stride: int = 128,    # overlap = seg_size - stride
-                 tile_round_to: int = 16,   # round full-res canvas to multiple of this
+                 tile_round_to: int = 16,   # pad full-res canvas to multiple of this
                  use_tiling: bool = True,
                  providers=None):
         export_dir = _find_export_dir(export_dir)
@@ -344,8 +364,8 @@ class KymoButlerPT:
     # --- public helper so tracker can get preprocessed gray at arbitrary hw ---
     def preproc_for_seg(self, img_gray: np.ndarray, hw: tuple[int, int] | None = None) -> np.ndarray:
         """
-        Return WL-like preprocessed grayscale resized to 'hw' if provided;
-        otherwise returns (seg_size, seg_size).
+        Return WL-like preprocessed grayscale in [0,1], resized to 'hw' if provided;
+        otherwise returns preprocessed image at (seg_size, seg_size).
         """
         x = _preproc_like_wl(img_gray)
         if hw is None:
@@ -361,25 +381,15 @@ class KymoButlerPT:
     # ========== TILED INFERENCE CORE ==========
     def _tile_infer_2d(self, img01: np.ndarray, run_fn, *, out_kind: str):
         """
-        Slide a (seg_h, seg_w) window with stride across img01 (H',W').
-        'run_fn(tile_nchw)->dict' should return ORT outputs for that tile.
-        out_kind: 'bi' -> single map; 'uni' -> two maps ('ant','ret' or 2ch)
+        Slide a (seg_h, seg_w) window with stride across *img01 as-is* (H',W').
+        IMPORTANT: caller is responsible for padding; we DO NOT resize here.
+        out_kind: 'bi' -> single map; 'uni' -> two maps ('ant','ret' or 2ch).
         Returns:
           if 'bi' : prob (H',W')
           if 'uni': dict {'ant': (H',W'), 'ret': (H',W')}
         """
         seg_h, seg_w = self.seg_hw
-        H, W = img01.shape
-        # Ensure canvas >= tile size
-        img01 = _ensure_min_hw(img01, seg_h, seg_w)
-        H, W = img01.shape
-
-        # Round canvas up to multiple of tile_round_to to stabilize coverage
-        Hr = _round_up(H, self.tile_round_to)
-        Wr = _round_up(W, self.tile_round_to)
-        if (Hr, Wr) != (H, W):
-            img01 = cv2.resize(img01, (Wr, Hr), interpolation=cv2.INTER_AREA)
-            H, W = Hr, Wr
+        H, W = img01.shape  # already padded by caller
 
         stride = self.tile_stride
         wy = list(range(0, max(1, H - seg_h + 1), stride))
@@ -431,21 +441,22 @@ class KymoButlerPT:
 
         if out_kind == "bi":
             prob_full = acc / np.maximum(wsum, eps)
-            return prob_full[:H, :W].astype(np.float32)
+            return prob_full.astype(np.float32)
         else:
             ant_full = acc_ant / np.maximum(wsum, eps)
             ret_full = acc_ret / np.maximum(wsum, eps)
             return {
-                "ant": ant_full[:H, :W].astype(np.float32),
-                "ret": ret_full[:H, :W].astype(np.float32),
+                "ant": ant_full.astype(np.float32),
+                "ret": ret_full.astype(np.float32),
             }
 
     # ========== CLASSIFIER / DECISION ==========
     def classify(self, img_gray: np.ndarray) -> dict:
         x = self._prep_gray(img_gray, self.clf_hw, wl_preproc=True)
         out = self.clf.run(x)
-        y = list(out.values())[0]  # expected [1,2]
-        logits = y[0]
+        y = list(out.values())[0]  # expected [1,2] or [1,1,2]
+        logits = np.squeeze(y, axis=0)  # -> [2] or [1,2]
+        logits = np.squeeze(logits)     # -> [2]
         probs = _softmax(logits, axis=-1)
         label = int(np.argmax(probs))
         return {"logits": logits, "probs": probs, "label": label}
@@ -473,6 +484,8 @@ class KymoButlerPT:
         Returns prob map at original size (if crop_to_original=True).
         """
         img01 = _preproc_like_wl(img_gray)
+
+        # Non-tiling path: center-crop/resize behavior (legacy)
         if not self.use_tiling:
             x = self._prep_gray(img_gray, self.bi_hw, wl_preproc=True)
             out = self.bi.run(x)
@@ -484,16 +497,24 @@ class KymoButlerPT:
                 return cv2.resize(prob, (W0, H0), interpolation=cv2.INTER_LINEAR)
             return prob
 
+        # Tiled path with *padding (no resizing)* to preserve alignment
         H0, W0 = img01.shape
-        Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
-        Wt = max(self.seg_hw[1], _round_up(W0, self.tile_round_to))
-        img01r = cv2.resize(img01, (Wt, Ht), interpolation=cv2.INTER_AREA)
+        seg_h, seg_w = self.seg_hw
 
+        # 1) Ensure at least one full tile
+        img_p, pads1 = _pad_to_at_least(img01, seg_h, seg_w)
+        # 2) Pad to multiple to stabilize coverage vs stride
+        img_p, pads2 = _pad_to_multiple(img_p, self.tile_round_to)
+        pt1, pl1, pb1, pr1 = pads1
+        pt2, pl2, pb2, pr2 = pads2
+        pt = pt1 + pt2; pl = pl1 + pl2  # (both zero by construction)
+        # Run tiled inference
         def _run(tile_nchw):
             return self.bi.run(tile_nchw)
-
-        prob = self._tile_infer_2d(img01r, _run, out_kind="bi")
-        return prob[:H0, :W0] if crop_to_original else prob
+        prob_full = self._tile_infer_2d(img_p, _run, out_kind="bi")
+        # Crop off padding; return exactly H0 x W0
+        prob = prob_full[pt:H0+pt, pl:W0+pl]
+        return prob if crop_to_original else prob_full
 
     def segment_uni_full(self, img_gray: np.ndarray, *, crop_to_original: bool = True) -> dict:
         """
@@ -501,6 +522,7 @@ class KymoButlerPT:
         Returns dict {'ant': HxW, 'ret': HxW} (cropped if crop_to_original=True).
         """
         img01 = _preproc_like_wl(img_gray)
+
         if not self.use_tiling:
             x = self._prep_gray(img_gray, self.uni_hw, wl_preproc=True)
             out = self.uni.run(x)
@@ -523,20 +545,24 @@ class KymoButlerPT:
                 ret = cv2.resize(ret, (W0, H0), interpolation=cv2.INTER_LINEAR)
             return {"ant": ant, "ret": ret}
 
+        # Tiled path with padding only
         H0, W0 = img01.shape
-        Ht = max(self.seg_hw[0], _round_up(H0, self.tile_round_to))
-        Wt = max(self.seg_hw[1], _round_up(W0, self.tile_round_to))
-        img01r = cv2.resize(img01, (Wt, Ht), interpolation=cv2.INTER_AREA)
+        seg_h, seg_w = self.seg_hw
+
+        img_p, pads1 = _pad_to_at_least(img01, seg_h, seg_w)
+        img_p, pads2 = _pad_to_multiple(img_p, self.tile_round_to)
+        pt1, pl1, pb1, pr1 = pads1
+        pt2, pl2, pb2, pr2 = pads2
+        pt = pt1 + pt2; pl = pl1 + pl2
 
         def _run(tile_nchw):
             return self.uni.run(tile_nchw)
+        out_full = self._tile_infer_2d(img_p, _run, out_kind="uni")
 
-        out_full = self._tile_infer_2d(img01r, _run, out_kind="uni")
         if crop_to_original:
-            return {
-                "ant": out_full["ant"][:H0, :W0],
-                "ret": out_full["ret"][:H0, :W0],
-            }
+            ant = out_full["ant"][pt:H0+pt, pl:W0+pl]
+            ret = out_full["ret"][pt:H0+pt, pl:W0+pl]
+            return {"ant": ant, "ret": ret}
         return out_full
 
     # ========== LEGACY (kept for compatibility) ==========
