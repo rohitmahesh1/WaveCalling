@@ -5,7 +5,7 @@ import pandas as pd
 
 # signal-processing modules (package-relative)
 from .signal.detrend import detrend_residual
-from .signal.peaks import detect_peaks
+from .signal.peaks import detect_peaks, detect_peaks_adaptive
 from .signal.period import estimate_dominant_frequency, frequency_to_period
 
 # visualization
@@ -19,9 +19,10 @@ from .visualize import (
 # I/O for tables → heatmaps
 from .io.table_to_heatmap import table_to_heatmap
 
-# NEW: features (wave rows builder, ids, etc.)
+# NEW: features (wave & peak row builders, ids, etc.)
 from .features import (
     build_wave_rows,
+    build_peak_rows,
     sample_id_from_name,
     coerce_track_id,
 )
@@ -62,11 +63,11 @@ def process_track(
     dpi: int | None = None,
     log=None,
     features_cfg: dict | None = None,
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], list[dict]]:
     """
     Load a track (.npy), compute residual, detect peaks (+props), estimate frequency,
     make plots (optional), and return:
-      (track_level_metrics_dict, [per-wave rows])
+      (track_level_metrics_dict, [per-wave rows], [per-peak rows])
     """
     data = np.load(arr_path)
     # assume data shape (N, 2): columns [x, y]
@@ -76,24 +77,61 @@ def process_track(
     # detrend
     residual = detrend_residual(x, y, **detrend_cfg)
 
-    # detect peaks on residual (keep props!)
-    peaks_idx, props = detect_peaks(residual, **peaks_cfg)
-
-    # global frequency and period
+    # global frequency and period (does NOT depend on peaks)
     freq = estimate_dominant_frequency(residual, **period_cfg)
     period = frequency_to_period(freq)
 
+    # Adaptive, period-aware peak detection (default).
+    # Can force legacy via YAML: peaks.adaptive: false
+    sampling_rate_eff = (sampling_rate if sampling_rate is not None else 1.0)
+    frames_per_period = (sampling_rate_eff / freq) if (sampling_rate_eff and np.isfinite(freq) and freq > 0) else None
+
+    use_adaptive = bool(peaks_cfg.get("adaptive", True))
+    if use_adaptive:
+        # Map optional adaptive knobs from YAML (with safe defaults)
+        peaks_idx, props = detect_peaks_adaptive(
+            residual,
+            frames_per_period=frames_per_period,
+            distance_frac=float(peaks_cfg.get("distance_frac", 0.6)),
+            width_frac=float(peaks_cfg.get("width_frac", 0.2)),
+            rel_mad_k=float(peaks_cfg.get("rel_mad_k", 2.0)),
+            abs_min_prom_px=float(peaks_cfg.get("abs_min_prom_px", 1.0)),
+            nms_enable=bool(peaks_cfg.get("nms_enable", True)),
+            nms_dominance_frac=float(peaks_cfg.get("nms_dominance_frac", 0.55)),
+        )
+    else:
+        # Legacy fixed thresholds
+        legacy_kwargs = {
+            "prominence": float(peaks_cfg.get("prominence", 1.0)),
+            "width": float(peaks_cfg.get("width", 1.0)),
+        }
+        if peaks_cfg.get("distance", None) is not None:
+            legacy_kwargs["distance"] = int(peaks_cfg["distance"])
+        peaks_idx, props = detect_peaks(residual, **legacy_kwargs)
+
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
 
-    # per-wave rows (k -> k+1) with enriched features & anchored fit params
     sample_name = _sample_name_from_arr_path(arr_path)
+
+    # per-wave rows (k -> k+1) with enriched features & anchored fit params
     wave_rows = build_wave_rows(
         x=x, y=y, residual=residual,
         peaks_idx=peaks_idx, peak_props=props,
-        sampling_rate=sampling_rate if sampling_rate is not None else 1.0,
+        sampling_rate=sampling_rate_eff,
         sample=sample_name, track_stem=arr_path.stem,
         features_cfg=features_cfg or {},
         freq_hz=float(freq) if np.isfinite(freq) else None,
+        period_frac_for_fit=float((features_cfg or {}).get("fit_window_period_frac", 0.5)),
+    )
+
+    # NEW: per-peak rows (anchored sine fit around EACH detected peak)
+    peak_rows = build_peak_rows(
+        x=x, y=y, residual=residual,
+        peaks_idx=peaks_idx, peak_props=props,
+        sampling_rate=sampling_rate_eff,
+        sample=sample_name, track_stem=arr_path.stem,
+        features_cfg=features_cfg or {},
+        global_freq_hz=float(freq) if np.isfinite(freq) else None,
         period_frac_for_fit=float((features_cfg or {}).get("fit_window_period_frac", 0.5)),
     )
 
@@ -162,7 +200,7 @@ def process_track(
         'dominant_frequency': float(freq),
         'period': float(period),
     }
-    return track_metrics, wave_rows
+    return track_metrics, wave_rows, peak_rows
 
 
 # -----------------------
@@ -468,10 +506,11 @@ def main():
     # process each track array
     track_results: list[dict] = []
     wave_results: list[dict] = []
+    peak_results: list[dict] = []
     for arr in arr_paths:
         log.debug(f'Processing track {arr.name}...')
         try:
-            metrics, wave_rows = process_track(
+            metrics, wave_rows, peak_rows = process_track(
                 arr,
                 detrend_cfg,
                 peaks_cfg,
@@ -486,6 +525,7 @@ def main():
             )
             track_results.append(metrics)
             wave_results.extend(wave_rows)
+            peak_results.extend(peak_rows)
         except Exception as e:
             log.exception(f'Failed on {arr}: {e}')
 
@@ -497,7 +537,6 @@ def main():
     # write per-wave results (sorted)
     waves_csv = Path(args.output_csv).with_name(Path(args.output_csv).stem + "_waves.csv")
     df_waves = pd.DataFrame(wave_results)
-
     if not df_waves.empty:
         df_waves["Track"] = pd.to_numeric(df_waves["Track"], errors="coerce").astype("Int64")
         df_waves = df_waves.sort_values(
@@ -505,14 +544,31 @@ def main():
             kind="mergesort",
             ignore_index=True,
         )
-
     df_waves.to_csv(waves_csv, index=False, na_rep="NA")
     log.info(f"Per-wave metrics saved to {waves_csv}")
 
+    # write per-peak results (sorted)
+    peaks_csv = Path(args.output_csv).with_name(Path(args.output_csv).stem + "_peaks.csv")
+    df_peaks = pd.DataFrame(peak_results)
+    if not df_peaks.empty:
+        df_peaks["Track"] = pd.to_numeric(df_peaks["Track"], errors="coerce").astype("Int64")
+        # sort by frame (time) then by amplitude descending as a tie-breaker
+        sort_cols = ["Track"]
+        if "Peak frame" in df_peaks.columns:
+            sort_cols.append("Peak frame")
+        if "Amplitude (pixels)" in df_peaks.columns:
+            sort_cols.append("Amplitude (pixels)")
+            df_peaks = df_peaks.sort_values(sort_cols, kind="mergesort", ascending=[True, True, False], ignore_index=True)
+        else:
+            df_peaks = df_peaks.sort_values(sort_cols, kind="mergesort", ignore_index=True)
+    df_peaks.to_csv(peaks_csv, index=False, na_rep="NA")
+    log.info(f"Per-peak metrics saved to {peaks_csv}")
+
     # summary plots (honor viz toggles) — based on track-level stats
-    if plots_dir is not None and make_summary_hists:
-        plot_summary_histograms(df_tracks, plots_dir, bins=hist_bins, dpi=dpi)
-        log.info(f"Summary plots saved under {plots_dir}")
+    plots_root = plots_dir
+    if plots_root is not None and make_summary_hists:
+        plot_summary_histograms(df_tracks, plots_root, bins=hist_bins, dpi=dpi)
+        log.info(f"Summary plots saved under {plots_root}")
 
 
 if __name__ == '__main__':
