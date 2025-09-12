@@ -118,6 +118,13 @@ def _fit_global_sine(
     yfit_res = X @ np.array([a, b, c])
     return yfit_res, float(A), float(phi), float(c)
 
+def _window_bounds(center_idx: int, frames_per_period: float, frac: float, n: int) -> tuple[int,int]:
+    """Return [lo, hi] index bounds around center_idx for a window of width=frac*period."""
+    frac = float(np.clip(frac, 0.01, 0.25))  # never show wider than 1/4 period
+    half_span = max(1, int(round((frac * frames_per_period) / 2.0)))
+    lo = max(0, int(center_idx) - half_span)
+    hi = min(n - 1, int(center_idx) + half_span)
+    return lo, hi
 
 def plot_peak_windows(
     x: np.ndarray,
@@ -129,17 +136,17 @@ def plot_peak_windows(
     ransac_kwargs: Optional[dict] = None,
     sampling_rate: float | None = None,
     freq: float | None = None,
-    period_frac: float = 0.5,     # fraction of ONE period to show (total width)
-    max_plots: int = 12,          # avoid hundreds of files
+    period_frac: float = 0.5,     # requested width (will be capped to 0.25 for display)
+    max_plots: int = 12,
     dpi: int | None = None,
     title_prefix: Optional[str] = None,
     overlay_fit: bool = True,
 ) -> List[Path]:
     """
-    For each peak, plot a window of width = period_frac * period centered on that peak.
-    Overlays baseline, residual, peak marker, and (optionally) baseline+sine fit
-    that is PHASE-ANCHORED at that peak.
-    Returns the list of saved file paths.
+    For each peak, plot a window centered on that peak. The DISPLAYED window
+    width is capped to 1/4 of one period regardless of the requested fraction.
+    Overlays baseline, residual, peak marker, and optionally a phase-anchored
+    sine fit (also truncated to the same window).
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -161,29 +168,36 @@ def plot_peak_windows(
         baseline = model.predict(x.reshape(-1, 1))
         residual = y - baseline
 
-    # Frames per period (for window size)
+    # Period (in frames) for window sizing
     if sampling_rate and freq and freq > 0:
-        frames_per_period = sampling_rate / float(freq)
+        frames_per_period = float(sampling_rate) / float(freq)
     else:
-        frames_per_period = 40.0  # fallback window width
-    half_span = max(1, int(round((period_frac * frames_per_period) / 2.0)))
+        frames_per_period = 40.0  # safe fallback
+
+    # Cap the displayed window to ≤ 1/4 period
+    disp_frac = float(np.clip(period_frac, 0.01, 0.25))
+    half_span = max(1, int(round((disp_frac * frames_per_period) / 2.0)))
 
     saved: List[Path] = []
     for j, pk in enumerate(peaks_idx[:max_plots]):
-        lo = max(0, int(pk) - half_span)
-        hi = min(len(x) - 1, int(pk) + half_span)
+        pk = int(pk)
+        if pk < 0 or pk >= len(x):
+            continue
+
+        lo = max(0, pk - half_span)
+        hi = min(len(x) - 1, pk + half_span)
 
         xs = x[lo:hi + 1]
         raw = y[lo:hi + 1]
         base = baseline[lo:hi + 1]
         res = residual[lo:hi + 1]
 
-        # Phase-anchored local overlay (baseline + sine centered at this peak)
+        # Phase-anchored local overlay (baseline + sine centered at this peak), truncated to window
         yfit_seg = None
         if overlay_fit and sampling_rate and freq and freq > 0:
             yfit_res_local, _, _, _ = _fit_global_sine(
-                residual, x, sampling_rate, freq,
-                center_peak_idx=int(pk)
+                residual, x, float(sampling_rate), float(freq),
+                center_peak_idx=pk
             )
             if yfit_res_local is not None:
                 yfit_seg = (baseline + yfit_res_local)[lo:hi + 1]
@@ -193,13 +207,18 @@ def plot_peak_windows(
         plt.plot(raw, xs, linewidth=1, label="raw")
         plt.plot(base, xs, linewidth=1, linestyle="--", label="baseline")
         plt.plot(res, xs, linewidth=1, label="residual")
-        plt.scatter(residual[pk], x[pk], s=25, label="peak")
+        # Peak marker on top
+        plt.scatter(
+            residual[pk], x[pk],
+            s=28, facecolors="none", edgecolors="C3", linewidths=1.4,
+            label="peak", zorder=6
+        )
         if yfit_seg is not None:
-            plt.plot(yfit_seg, xs, linewidth=1.2, alpha=0.95, label="sine fit (anchored)")
+            plt.plot(yfit_seg, xs, linewidth=1.2, alpha=0.95, label="sine fit (anchored)", zorder=5)
 
         plt.xlabel("Position")
         plt.ylabel("Time")
-        ttl = f"{title_prefix or 'track'} – peak {j} @ idx {int(pk)}"
+        ttl = f"{title_prefix or 'track'} – peak {j} @ idx {pk}"
         plt.title(ttl)
         plt.legend()
         plt.tight_layout()
@@ -210,7 +229,6 @@ def plot_peak_windows(
         saved.append(out)
 
     return saved
-
 
 def plot_detrended_with_peaks(
     x: np.ndarray,
@@ -232,11 +250,11 @@ def plot_detrended_with_peaks(
 ) -> Path:
     """
     Plot raw y, robust baseline (RANSAC poly), residual, and mark peaks,
-    with axes flipped so X = position, Y = time.
+    with axes flipped (X=position, Y=time).
 
-    If overlay_fit is True (and sampling_rate & freq are provided),
-    also draw (baseline + global sine fit) over the raw track, with phase
-    **anchored at the strongest detected peak**.
+    If overlay_fit is True and (sampling_rate & freq) are valid, draw a global
+    sine fit PHASE-ANCHORED at the strongest detected peak, but only display
+    that fit within a strict 1/4-period window around the anchor.
     """
     save_path = _ensure_parent(save_path)
     ransac_kwargs = (ransac_kwargs or {}).copy()
@@ -263,26 +281,51 @@ def plot_detrended_with_peaks(
     # residual (axes flipped)
     plt.plot(residual, x, linewidth=1, label="residual")
 
-    # peaks
+    # peaks (sanitized), drawn on top so they never hide behind lines
     peaks_idx = np.asarray(list(peaks_idx), dtype=int)
+    peaks_idx = peaks_idx[(peaks_idx >= 0) & (peaks_idx < len(x))]
+    peaks_idx = np.unique(peaks_idx)
     if peaks_idx.size:
-        plt.scatter(residual[peaks_idx], x[peaks_idx], s=20, label="peaks")
+        plt.scatter(
+            residual[peaks_idx], x[peaks_idx],
+            s=28, facecolors="none", edgecolors="C3", linewidths=1.4,
+            label="peaks", zorder=6
+        )
 
-    # optional global-sine overlay: (baseline + fitted residual), anchored
+    # optional global-sine overlay (anchored), strictly truncated to 1/4 period if a peak anchor exists
     if overlay_fit and (sampling_rate is not None) and (freq is not None) and freq > 0:
         center_idx = None
         if peaks_idx.size:
-            # anchor to the strongest residual peak
             center_idx = int(peaks_idx[np.argmax(residual[peaks_idx])])
+
         yfit_res, A, phi, c = _fit_global_sine(
-            residual, x, sampling_rate, freq,
+            residual, x, float(sampling_rate), float(freq),
             amp_override=amp_override, phase_override=phase_override,
             center_peak_idx=center_idx
         )
         if yfit_res is not None:
             yfit = (baseline if baseline is not None else 0.0) + yfit_res
+
+            # Mask outside of strict quarter-period window if we have an anchor
+            if center_idx is not None:
+                frames_per_period = float(sampling_rate) / float(freq)
+                disp_frac = 0.25
+                half_span = max(1, int(round((disp_frac * frames_per_period) / 2.0)))
+                lo = max(0, center_idx - half_span)
+                hi = min(len(x) - 1, center_idx + half_span)
+                yfit_masked = np.full_like(yfit, np.nan, dtype=float)
+                yfit_masked[lo:hi + 1] = yfit[lo:hi + 1]
+            else:
+                # No anchor → draw full fit (rare, since peaks usually exist)
+                yfit_masked = yfit
+
             # axes flipped
-            plt.plot(yfit, x, linewidth=1.2, alpha=0.9, label=f"sine fit (anchored) f={freq:.3g}Hz")
+            plt.plot(
+                yfit_masked, x,
+                linewidth=1.25, alpha=0.95,
+                label=f"sine fit (anchored) f={float(freq):.3g}Hz",
+                zorder=5,
+            )
 
     plt.xlabel("Position")
     plt.ylabel("Time")
@@ -295,7 +338,6 @@ def plot_detrended_with_peaks(
         plt.show()
     plt.close()
     return save_path
-
 
 def plot_spectrum(
     residual: np.ndarray,
@@ -326,7 +368,6 @@ def plot_spectrum(
         plt.show()
     plt.close()
     return save_path
-
 
 def plot_summary_histograms(
     metrics_df: pd.DataFrame,
