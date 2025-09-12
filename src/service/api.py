@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
+import logging
 import math
 import os
 
@@ -22,12 +23,14 @@ import asyncio
 import json
 import shutil
 import uuid
+import hashlib
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
+from fastapi import Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +39,14 @@ from sse_starlette.sse import EventSourceResponse
 
 # Pipeline generator (emits JobEvent)
 from .pipeline import _sample_name_from_arr_path, iter_run_project, JobEvent
+
+
+# --- SSE tuning (env-configurable) ---
+# Set SSE_PING_SECONDS=0 in dev to disable heartbeats (reduces socket.send noise).
+SSE_PING_SECONDS = int(os.getenv("SSE_PING_SECONDS", "25"))  # 0 → disables pings
+SSE_LOG_SUBS = os.getenv("SSE_LOG_SUBS", "0") == "1"         # 1 → log +sub/-sub
+
+logger = logging.getLogger("wavecalling.sse")
 
 # ---- Config ----
 APP_ROOT = Path(__file__).resolve().parents[2]  # repo root
@@ -64,11 +75,20 @@ def _write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, indent=2)
     tmp.replace(path)
 
+# ---- ETag helpers ----
+def _sha1_etag_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def _weak_file_etag(p: Path) -> str:
+    st = p.stat()
+    # weak etag from mtime+size (fast; stable across restarts)
+    return f'W/"{int(st.st_mtime_ns)}-{st.st_size}"'
+
 def _sanitize_for_json(obj):
-    import math
-    import numpy as np  # ensure available here
+    """Recursively replace NaN/Inf with None; convert numpy scalars to python."""
     if isinstance(obj, (float, np.floating)):
-        return float(obj) if math.isfinite(float(obj)) else None
+        f = float(obj)
+        return f if math.isfinite(f) else None
     if isinstance(obj, (int, np.integer)):
         return int(obj)
     if isinstance(obj, dict):
@@ -195,6 +215,13 @@ class _RunState:
         # Persist initial snapshot
         self._persist_run_json()
 
+        # versioning for overlay changes
+        self.overlay_version: int = 0
+        self._overlay_mtime_ns: int = 0  # last seen mtime for whichever overlay file is active
+
+    def subscribers_count(self) -> int:
+        return len(self._subscribers)
+
     # ---------- persistence ----------
     def _persist_run_json(self) -> None:
         payload = {
@@ -258,10 +285,59 @@ class _RunState:
             self.error = error
         self._persist_run_json()
 
+    # ---------- overlay versioning ----------
+    def maybe_bump_overlay_version(self) -> bool:
+        """Detect if overlay output changed (by mtime) and bump version."""
+        overlay_dir = self.output_dir / "overlay"
+        if not overlay_dir.exists():
+            return False
+        # prefer final > partial > ndjson
+        cand = [
+            overlay_dir / "tracks.json",
+            overlay_dir / "tracks.partial.json",
+            overlay_dir / "tracks.ndjson",
+        ]
+        p = next((x for x in cand if x.exists()), None)
+        if not p:
+            return False
+        try:
+            mtime_ns = p.stat().st_mtime_ns
+        except FileNotFoundError:
+            return False
+        if mtime_ns > self._overlay_mtime_ns:
+            self._overlay_mtime_ns = mtime_ns
+            self.overlay_version += 1
+            return True
+        return False
+
 
 # Global registry (in-memory)
 _RUNS: Dict[str, _RunState] = {}
+# -----------------------
+# Global "runs" pub/sub (dashboard updates)
+# -----------------------
+_GLOBAL_SUBS: List[asyncio.Queue] = []
+_GLOBAL_LOCK = asyncio.Lock()
 
+
+async def _global_add_sub() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    async with _GLOBAL_LOCK:
+        _GLOBAL_SUBS.append(q)
+    return q
+
+async def _global_remove_sub(q: asyncio.Queue) -> None:
+    async with _GLOBAL_LOCK:
+        if q in _GLOBAL_SUBS:
+            _GLOBAL_SUBS.remove(q)
+
+async def _publish_runs_dirty() -> None:
+    async with _GLOBAL_LOCK:
+        for q in list(_GLOBAL_SUBS):
+            try:
+                q.put_nowait({"type": "runs", "dirty": {"list": True}, "ts": _iso_now()})
+            except asyncio.QueueFull:
+                pass
 
 # -----------------------
 # Models / payloads
@@ -305,6 +381,23 @@ async def _save_uploads(files, out_dir: Path) -> list[Path]:
         saved_paths.append(out_path)
 
     return saved_paths
+
+def _artifact_paths_by_state(state: _RunState) -> Dict[str, Path]:
+    o = state.output_dir
+    base = state.base_dir
+    return {
+        "tracks_csv": o / "metrics.csv",
+        "waves_csv": o / "metrics_waves.csv",
+        "overlay_json": o / "overlay" / "tracks.json",
+        "overlay_json_partial": o / "overlay" / "tracks.partial.json",
+        "overlay_ndjson": o / "overlay" / "tracks.ndjson",
+        "run_json": base / "run.json",
+        "events_ndjson": base / "events.ndjson",
+        "progress_json": o / "progress.json",
+        "plots_dir": base / "plots",
+        "output_dir": o,
+        "base_image": o / "base.png",
+    }
 
 def _resolve_progress_paths_for_state(st: _RunState) -> Tuple[Path, List[Path]]:
     """Resolve progress.json + candidate marker dirs based on a live state's config."""
@@ -510,6 +603,9 @@ async def create_run(
     # Kick off worker task (async)
     asyncio.create_task(_run_pipeline(state, overrides, verbose))
 
+    # notify dashboards to refresh run list
+    await _publish_runs_dirty()
+
     return CreateRunResponse(run_id=run_id, status=state.status, info=state.info())
 
 
@@ -561,7 +657,6 @@ async def get_run_artifacts(run_id: str):
         raise HTTPException(status_code=404, detail="Unknown run_id")
     return JSONResponse(_artifact_urls_by_id(run_id))
 
-
 @app.get("/api/runs/{run_id}/events")
 async def stream_events(run_id: str, replay: int = Query(0, description=">1 = last N historical events first")):
     """
@@ -575,6 +670,11 @@ async def stream_events(run_id: str, replay: int = Query(0, description=">1 = la
         raise HTTPException(status_code=404, detail="Unknown run_id")
 
     q = await st.add_subscriber()
+    if SSE_LOG_SUBS:
+        try:
+            logger.info("[SSE] +sub %s subs=%d", run_id, st.subscribers_count())
+        except Exception:
+            logger.info("[SSE] +sub %s", run_id)
 
     def _to_url(p: str) -> str:
         """Map a local file path to its served URL under /runs/<id>/..."""
@@ -651,37 +751,66 @@ async def stream_events(run_id: str, replay: int = Query(0, description=">1 = la
                 if evt.phase in ("DONE", "ERROR", "CANCELLED"):
                     break
         except asyncio.CancelledError:
-            # client disconnected
+            # client disconnected mid-stream (normal)
             return
         finally:
             await st.remove_subscriber(q)
+            if SSE_LOG_SUBS:
+                try:
+                    logger.info("[SSE] -sub %s subs=%d", run_id, st.subscribers_count())
+                except Exception:
+                    logger.info("[SSE] -sub %s", run_id)
 
-    # keep-alive ping (seconds) — slightly longer to reduce noisy disconnect warnings
+    # Response headers: avoid buffering and caching
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",  # helps with nginx (no buffering of event stream)
+    }
+
+    # Set ping to env value; 0 disables heartbeats (quiet dev logs)
+    ping_value = None if SSE_PING_SECONDS <= 0 else SSE_PING_SECONDS
+
+    return EventSourceResponse(gen(), ping=ping_value, headers=headers)
+
+@app.get("/api/runs/events")
+async def stream_runs_events():
+    q = await _global_add_sub()
+    async def gen():
+        try:
+            # initial nudge so clients can immediately refresh once
+            yield {"event": "message", "data": json.dumps({"type": "runs", "dirty": {"list": True}})}
+            while True:
+                msg = await q.get()
+                yield {"event": "message", "data": json.dumps(msg)}
+        except asyncio.CancelledError:
+            return
+        finally:
+             await _global_remove_sub(q)
     return EventSourceResponse(gen(), ping=25)
 
-
 @app.get("/api/runs/{run_id}/overlay")
-async def get_overlay(run_id: str):
+async def get_overlay(run_id: str, request: Request):
     st = _RUNS.get(run_id)
-    if not st:
+    base = _run_dir(run_id)
+    if not (st or base.exists()):
         raise HTTPException(status_code=404, detail="Unknown run_id")
-    final = st.output_dir / "overlay" / "tracks.json"
-    partial = st.output_dir / "overlay" / "tracks.partial.json"
-    ndjson = st.output_dir / "overlay" / "tracks.ndjson"
+    output_dir = (st.output_dir if st else (base / "output"))
+    final = Path(output_dir) / "overlay" / "tracks.json"
+    partial = Path(output_dir) / "overlay" / "tracks.partial.json"
+    ndjson = Path(output_dir) / "overlay" / "tracks.ndjson"
 
-    if final.exists():
-        with open(final) as f:
-            data = json.load(f)
-        return JSONResponse(_sanitize_for_json(data))
+    target = next((p for p in (final, partial, ndjson) if p.exists()), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Overlay not available yet")
 
-    if partial.exists():
-        with open(partial) as f:
-            data = json.load(f)
-        return JSONResponse(_sanitize_for_json(data))
+    etag = _weak_file_etag(target)
+    inm = request.headers.get("if-none-match")
+    if inm and inm == etag:
+        return Response(status_code=304, headers={"ETag": etag})
 
-    if ndjson.exists():
+    if target == ndjson:
         tracks = []
-        with open(ndjson) as f:
+        with target.open() as f:
             for line in f:
                 s = line.strip()
                 if not s:
@@ -691,9 +820,16 @@ async def get_overlay(run_id: str):
                 except Exception:
                     continue
                 tracks.append(_sanitize_for_json(obj))
-        return JSONResponse({"version": 1, "tracks": tracks})
+        body = json.dumps({"version": 1, "tracks": tracks}).encode("utf-8")
+    else:
+        with target.open("r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Invalid overlay JSON: {e}")
+        body = json.dumps(_sanitize_for_json(data)).encode("utf-8")
 
-    raise HTTPException(status_code=404, detail="Overlay not available yet")
+    return Response(content=body, media_type="application/json", headers={"ETag": etag})
 
 
 @app.get("/api/runs/{run_id}/image")
@@ -794,7 +930,7 @@ async def resume_run(run_id: str, verbose: bool = Form(False)):
 
 
 @app.get("/api/runs/{run_id}/progress")
-async def get_progress(run_id: str):
+async def get_progress(run_id: str, request: Request) -> Response:
     """
     Return pipeline progress:
       {
@@ -817,62 +953,90 @@ async def get_progress(run_id: str):
             raise HTTPException(status_code=404, detail="Unknown run_id")
         progress_path, marker_dirs = _resolve_progress_paths_for_disk(run_id)
 
+    payload: Optional[dict] = None
+
     # 1) Preferred: read progress.json
     if progress_path.exists():
         try:
             with progress_path.open() as f:
                 data = json.load(f)
             data.setdefault("source", "file")
-            return JSONResponse(data)
+            payload = data
         except Exception:
             # fall through to synthesized
-            pass
+            payload = None
 
     # 2) Synthesized fallback using marker dirs + events.ndjson
-    processed_count = 0
-    for md in marker_dirs:
-        if md.exists():
+    if payload is None:
+        processed_count = 0
+        for md in marker_dirs:
+            if md.exists():
+                try:
+                    processed_count = max(processed_count, sum(1 for _ in md.glob("*.done")))
+                except Exception:
+                    continue
+
+        total_tracks: Optional[int] = None
+        skipped_count: Optional[int] = None
+        last_updated: Optional[str] = None
+
+        nd = _events_path(run_id)
+        if nd.exists():
             try:
-                processed_count = max(processed_count, sum(1 for _ in md.glob("*.done")))
+                max_total_tracks = 0
+                with nd.open() as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            evt = json.loads(line)
+                            if isinstance(evt.get("extra"), dict):
+                                extra = evt["extra"]
+                                if "total" in extra and isinstance(extra["total"], int):
+                                    max_total_tracks = max(max_total_tracks, int(extra["total"]))
+                                if "total_tracks" in extra and isinstance(extra["total_tracks"], int):
+                                    max_total_tracks = max(max_total_tracks, int(extra["total_tracks"]))
+                            last_updated = evt.get("ts") or last_updated
+                        except Exception:
+                            continue
+                total_tracks = max_total_tracks or None
             except Exception:
-                continue
+                pass
 
-    total_tracks: Optional[int] = None
-    skipped_count: Optional[int] = None
-    last_updated: Optional[str] = None
+        payload = {
+            "totalTracks": total_tracks if total_tracks is not None else (processed_count if processed_count else None),
+            "processedCount": int(processed_count),
+            "skippedCount": skipped_count,
+            "lastUpdatedAt": last_updated,
+            "source": "synthesized",
+        }
 
-    nd = _events_path(run_id)
-    if nd.exists():
-        try:
-            max_total_tracks = 0
-            with nd.open() as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                        if isinstance(evt.get("extra"), dict):
-                            extra = evt["extra"]
-                            if "total" in extra and isinstance(extra["total"], int):
-                                max_total_tracks = max(max_total_tracks, int(extra["total"]))
-                            if "total_tracks" in extra and isinstance(extra["total_tracks"], int):
-                                max_total_tracks = max(max_total_tracks, int(extra["total_tracks"]))
-                        last_updated = evt.get("ts") or last_updated
-                    except Exception:
-                        continue
-            total_tracks = max_total_tracks or None
-        except Exception:
-            pass
+    # ---- ETag / If-None-Match handling ----
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    etag = _sha1_etag_bytes(body)
 
-    payload = {
-        "totalTracks": total_tracks if total_tracks is not None else (processed_count if processed_count else None),
-        "processedCount": int(processed_count),
-        "skippedCount": skipped_count,
-        "lastUpdatedAt": last_updated,
-        "source": "synthesized",
-    }
-    return JSONResponse(payload)
+    inm = request.headers.get("if-none-match")
+    if inm:
+        # Handle multiple ETags and weak validators
+        def _norm(tag: str) -> str:
+            t = tag.strip()
+            if t.startswith("W/"):
+                t = t[2:].strip()
+            return t
+        client_tags = [_norm(t) for t in inm.split(",")]
+        if etag in client_tags or "*" in client_tags:
+            # Not modified; return headers but no body
+            return Response(status_code=304, headers={"ETag": etag})
+
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, must-revalidate",
+        },
+    )
 
 
 @app.get("/api/health")
@@ -911,20 +1075,10 @@ async def delete_run(run_id: str, force: int = Query(0, description="1 = cancel 
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
 
     _RUNS.pop(run_id, None)
-    return {"deleted": run_id}
 
-def _sanitize_for_json(obj):
-    """Recursively replace NaN/Inf with None; convert numpy scalars to python."""
-    if isinstance(obj, (float, np.floating)):
-        f = float(obj)
-        return f if math.isfinite(f) else None
-    if isinstance(obj, (int, np.integer)):
-        return int(obj)
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(x) for x in obj]
-    return obj
+    await _publish_runs_dirty()
+
+    return {"deleted": run_id}
 
 def _sample_name_from_arr_path(arr_path: Path) -> str:
     base = arr_path.parent.parent.name
@@ -969,6 +1123,73 @@ def _lookup_metrics_freq(run_dir: Path, track_id: str | int) -> Optional[float]:
     except Exception:
         return None
     return None
+
+@app.get("/api/runs/{run_id}/snapshot")
+async def get_snapshot(run_id: str, request: Request):
+    """
+    Authoritative, compact state for a run:
+      - status, error
+      - overlay_version (monotone)
+      - artifact existence flags
+      - (optional) tiny progress summary when available
+    """
+    st = _RUNS.get(run_id)
+    # allow disk fallback so snapshots work after restart
+    if not st:
+        d = _run_dir(run_id)
+        if not d.exists():
+            raise HTTPException(status_code=404, detail="Unknown run_id")
+        info = _synthesize_info_from_dir(d)
+        if not info:
+            raise HTTPException(status_code=404, detail="Unknown run_id")
+        # cheap overlay version from mtime
+        overlay_dir = d / "output" / "overlay"
+        ov_paths = [overlay_dir / "tracks.json", overlay_dir / "tracks.partial.json", overlay_dir / "tracks.ndjson"]
+        try:
+            mtime_ns = max((p.stat().st_mtime_ns for p in ov_paths if p.exists()), default=0)
+        except Exception:
+            mtime_ns = 0
+        overlay_version = 1 if mtime_ns else 0
+        paths = _artifact_paths_by_state(_RunState(run_id=info.run_id, name=info.name, base_dir=d,
+                                                   config_path=Path(info.config_path),
+                                                   created_at_iso=info.created_at, status=info.status))
+        flags = {k: p.exists() for k, p in paths.items()}
+        payload = {
+            "run_id": info.run_id,
+            "status": info.status,
+            "error": info.error,
+            "overlay_version": overlay_version,
+            "artifacts": flags,
+        }
+    else:
+        # live run
+        st.maybe_bump_overlay_version()
+        paths = _artifact_paths_by_state(st)
+        flags = {k: p.exists() for k, p in paths.items()}
+        # try to include tiny progress if file exists (no heavy synth here)
+        prog_path, _ = _resolve_progress_paths_for_state(st)
+        prog = None
+        if prog_path.exists():
+            try:
+                with prog_path.open() as f:
+                    prog = json.load(f)
+            except Exception:
+                prog = None
+        payload = {
+            "run_id": st.run_id,
+            "status": st.status,
+            "error": st.error,
+            "overlay_version": st.overlay_version,
+            "artifacts": flags,
+            "progress": prog if isinstance(prog, dict) else None,
+        }
+
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    etag = _sha1_etag_bytes(body)
+    inm = request.headers.get("if-none-match")
+    if inm and inm == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(content=body, media_type="application/json", headers={"ETag": etag})
 
 
 @app.get("/api/runs/{run_id}/tracks/{track_id}")
