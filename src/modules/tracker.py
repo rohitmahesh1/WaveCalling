@@ -125,6 +125,7 @@ class CrossingTracker:
                  min_track_len: int = 8,
                  decision_recent_tail: int = 12,
                  decision_thr: float = 0.0,
+                 decision_topk: int = 8,          # NEW: top-K mean for branch scoring
                  seed_interior: bool = True,
                  max_iters: int = 50):
         """
@@ -137,6 +138,7 @@ class CrossingTracker:
         self.min_track_len = int(min_track_len)
         self.decision_recent_tail = int(decision_recent_tail)
         self.decision_thr = float(decision_thr)
+        self.decision_topk = max(1, int(decision_topk))
         self.seed_interior = bool(seed_interior)
         self.max_iters = int(max_iters)
         self._raw01_cache: Optional[np.ndarray] = None  # set per extract() call
@@ -164,33 +166,55 @@ class CrossingTracker:
     def _score_branches(self, raw01: np.ndarray, skel_all: np.ndarray,
                         curr_pts: List[Coord], junction: Coord,
                         cand_starts: List[Coord]) -> Optional[Coord]:
-        """Score candidate branch starts using the decision map; return the best (or None)."""
+        """
+        Score candidate branch starts using the decision map; return the best (or None).
+        Gate: if a branch's max probability along its preview path is below decision_thr,
+              it is rejected outright (WL-like confidence gate).
+        Score: mean of top-K probabilities along the preview path (stable vs. length).
+        """
         H, W = raw01.shape
         jy, jx = junction
         tail_pts = curr_pts[-self.decision_recent_tail:] if curr_pts else []
         curr_mask = path_mask((H, W), tail_pts, radius=0)
         hh, hw = self.ch // 2, self.cw // 2
+
+        # one decision map per junction
         crop_raw  = crop_with_pad(raw01, jy, jx, hh, hw)
         crop_all  = crop_with_pad(skel_all, jy, jx, hh, hw)
         crop_curr = crop_with_pad(curr_mask, jy, jx, hh, hw)
-        prob = self.kb.decision_map(crop_raw, crop_all, crop_curr)  # [Hc,Wc] in 0..1
+        dmap = self.kb.decision_map(crop_raw, crop_all, crop_curr)  # [Hc,Wc] in 0..1
 
-        best_start, best_score = None, -1.0
+        best_start: Optional[Coord] = None
+        best_score: float = -1.0
+
         for sy, sx in cand_starts:
             branch_pts = self._walk_branch_preview(skel_all, junction, (sy, sx), self.max_branch_steps)
             if not branch_pts:
                 continue
-            scores = []
+
+            ps: List[float] = []
             for y, x in branch_pts:
                 cy, cx = y - (jy - hh), x - (jx - hw)
-                if 0 <= cy < prob.shape[0] and 0 <= cx < prob.shape[1]:
-                    p = prob[cy, cx]
-                    if p >= self.decision_thr:
-                        scores.append(p)
-            score = float(np.sum(scores)) if scores else 0.0
+                if 0 <= cy < dmap.shape[0] and 0 <= cx < dmap.shape[1]:
+                    ps.append(float(dmap[cy, cx]))
+
+            if not ps:
+                continue
+
+            pmax = max(ps)
+            if pmax < self.decision_thr:
+                # hard gate: this branch is not trusted
+                continue
+
+            # Stable score: mean of top-K probs along the preview
+            k = min(self.decision_topk, len(ps))
+            score = float(np.mean(sorted(ps, reverse=True)[:k]))
+
             if score > best_score:
-                best_score, best_start = score, (sy, sx)
-        return best_start
+                best_score = score
+                best_start = (sy, sx)
+
+        return best_start  # may be None -> triggers fallback straightness
 
     def _walk_branch_preview(self, skel: np.ndarray, prev: Coord,
                              start: Coord, max_steps: int) -> List[Coord]:
@@ -260,7 +284,7 @@ class CrossingTracker:
             else:
                 chosen = self._score_branches(raw01, skel, acc, (y, x), nbrs)
                 if chosen is None:
-                    # fallback: straightness toward previous direction
+                    # fallback: pick the neighbor that best continues the incoming direction
                     vy, vx = y - prev_y, x - prev_x
                     def straightness(n):
                         dy, dx = n[0] - y, n[1] - x
