@@ -1,3 +1,4 @@
+// frontend/src/components/ui/CollapsiblePane.tsx
 import * as React from "react";
 
 type Props = {
@@ -65,7 +66,6 @@ export default function CollapsiblePane({
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (!open) return;
-    // Start drag when pressing on the left edge
     const pane = paneRef.current;
     if (!pane) return;
     dragRef.current = { startX: e.clientX, startW: pane.offsetWidth };
@@ -89,21 +89,21 @@ export default function CollapsiblePane({
     }
   };
 
-  // keyboard: collapse/expand via Enter/Space on header button
   const toggleOpen = React.useCallback(() => setOpen((v) => !v), []);
-
-  // Double-click rail to reset width
   const onDoubleClickRail = () => setWidth(defaultWidth);
 
-  // Calculated styles
   const paneStyle: React.CSSProperties = open
     ? { width: `${width}px` }
-    : { width: "28px" }; // collapsed rail width (keeps a small tab visible)
+    : { width: "28px" }; // collapsed rail width
+
+  // Minimum inner content width so wide grid rows can scroll instead of clipping.
+  // Tweak if your editor rows get wider.
+  const CONTENT_MIN_PX = 560;
 
   return (
     <div
       ref={paneRef}
-      className={`relative h-full ${className || ""}`}
+      className={`relative h-full min-w-0 ${className || ""}`}  // min-w-0 allows the flex child to shrink
       style={paneStyle}
       aria-label={title}
       aria-expanded={open}
@@ -126,7 +126,7 @@ export default function CollapsiblePane({
         ].join(" ")}
       />
 
-      {/* Collapsed tab (shows only the toggle button) */}
+      {/* Collapsed tab */}
       {!open && (
         <div className="h-full pl-2 flex items-start">
           <button
@@ -143,7 +143,7 @@ export default function CollapsiblePane({
 
       {/* Pane content */}
       {open && (
-        <section className="h-full rounded-xl border border-slate-700/50 bg-console-700 flex flex-col">
+        <section className="h-full rounded-xl border border-slate-700/50 bg-console-700 flex flex-col min-w-0">
           <header className="flex items-center justify-between gap-2 px-3 py-2 border-b border-slate-700/50">
             <h3 className="text-slate-200 font-semibold truncate">{title}</h3>
             <div className="flex items-center gap-2">
@@ -160,7 +160,17 @@ export default function CollapsiblePane({
             </div>
           </header>
 
-          <div className="flex-1 min-h-0 overflow-auto p-3">{children}</div>
+          {/* Scroll containers:
+              - outer: vertical scroll, allow shrinking (min-w-0)
+              - middle: horizontal scroll
+              - inner: establish a minimum content width */}
+          <div className="flex-1 min-h-0 min-w-0 overflow-y-auto">
+            <div className="w-full min-w-0 overflow-x-auto">
+              <div className="p-3" style={{ minWidth: `${CONTENT_MIN_PX}px` }}>
+                {children}
+              </div>
+            </div>
+          </div>
         </section>
       )}
     </div>
