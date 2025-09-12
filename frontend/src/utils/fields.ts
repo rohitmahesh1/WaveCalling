@@ -32,6 +32,7 @@ const toLabel = (key: string) =>
  * Adds a few convenience fields:
  *  - points: poly length
  *  - peaks_count: peaks length
+ *  - csv.*: everything from the CSV augmentation object (if present)
  */
 export function flattenTrack(track: any): Record<string, any> {
   const out: Record<string, any> = {};
@@ -50,13 +51,14 @@ export function flattenTrack(track: any): Record<string, any> {
     }
   }
 
-  // Seed a shallow object that includes convenience fields
+  // IMPORTANT: include csv augmentation so catalog sees csv.*
   const seed = {
     id: track?.id,
     sample: track?.sample,
     points: Array.isArray(track?.poly) ? track.poly.length : undefined,
     peaks_count: Array.isArray(track?.peaks) ? track.peaks.length : undefined,
     metrics: track?.metrics ?? {},
+    csv: track?.csv ?? {}, // <-- add this
   };
 
   walk("", seed);
@@ -65,7 +67,8 @@ export function flattenTrack(track: any): Record<string, any> {
 
 /**
  * Infer field definitions from up to `sampleCount` tracks.
- * Skips arrays/objects when deciding kinds; collects enumValues for low-card strings.
+ * - Recognizes numeric-like strings as numbers.
+ * - Builds enum values for low-cardinality strings.
  */
 export function buildFieldCatalog(tracks: any[], sampleCount = 1000): FieldDef[] {
   const samples = tracks.slice(0, sampleCount).map(flattenTrack);
@@ -74,23 +77,31 @@ export function buildFieldCatalog(tracks: any[], sampleCount = 1000): FieldDef[]
   const keys = new Set<string>();
   for (const s of samples) for (const k of Object.keys(s)) keys.add(k);
 
-  // Helper to infer kind
+  const isNumericLike = (v: any) => {
+    if (typeof v === "number") return Number.isFinite(v);
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n);
+    }
+    return false;
+  };
+
   function inferKind(values: any[]): FieldKind {
     const scalars = values.filter(
       (v) => v !== null && v !== undefined && typeof v !== "object"
     );
     if (scalars.length === 0) return "string";
-    const allNum = scalars.every((v) => typeof v === "number" && Number.isFinite(v));
-    if (allNum) return "number";
-    const allBool = scalars.every((v) => typeof v === "boolean");
-    if (allBool) return "boolean";
+    if (scalars.every(isNumericLike)) return "number";
+    if (scalars.every((v) => typeof v === "boolean" || v === "true" || v === "false")) {
+      return "boolean";
+    }
     return "string";
   }
 
   const defs: FieldDef[] = [];
 
   for (const path of keys) {
-    // Skip obviously non-useful keys if you want (e.g. raw arrays). Since we seeded only primitives, we’re fine.
+    // Only keep scalar-ish values
     const vals = samples
       .map((s) => s[path])
       .filter((v) => v !== null && v !== undefined && typeof v !== "object");
@@ -99,7 +110,7 @@ export function buildFieldCatalog(tracks: any[], sampleCount = 1000): FieldDef[]
 
     const kind = inferKind(vals);
 
-    // Build enumValues for low-cardinality strings
+    // enumValues for low-card strings
     let enumValues: string[] | undefined;
     if (kind === "string") {
       const uniq = Array.from(new Set(vals.map(String)));
@@ -124,6 +135,8 @@ export function buildFieldCatalog(tracks: any[], sampleCount = 1000): FieldDef[]
     ["peaks_count", 5],
     ["sample", 6],
     ["id", 7],
+    // Optionally nudge csv.* up by giving them a mid priority if you like:
+    // ["csv", 20],
   ]);
 
   defs.sort((a, b) => {
