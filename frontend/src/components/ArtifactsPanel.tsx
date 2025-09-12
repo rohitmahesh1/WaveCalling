@@ -1,8 +1,12 @@
+// frontend/src/components/ArtifactsPanel.tsx
 import * as React from "react";
 import type { ArtifactMap } from "@/utils/types";
 
 type Props = {
-  artifacts: ArtifactMap | null | undefined;
+  /** Map of artifact key -> URL (from /api/runs/:id/artifacts). */
+  artifactUrls?: ArtifactMap | null | undefined;
+  /** Existence flags from /api/runs/:id/snapshot.artifacts (key -> bool). */
+  artifactFlags?: Record<string, boolean> | null | undefined;
   className?: string;
   title?: string;
 };
@@ -60,14 +64,18 @@ function suggestFilename(u: string, labelKey: string) {
   }
 }
 
-export default function ArtifactsPanel({ artifacts, className, title = "Artifacts" }: Props) {
+export default function ArtifactsPanel({
+  artifactUrls,
+  artifactFlags,
+  className,
+  title = "Artifacts",
+}: Props) {
   const [copiedKey, setCopiedKey] = React.useState<string | null>(null);
-  const [existing, setExisting] = React.useState<Record<string, boolean>>({}); // key -> exists?
 
+  // Build ordered list of [key, url]
   const pairs = React.useMemo(() => {
-    if (!artifacts) return [] as [string, string][];
-    const entries = Object.entries(artifacts).filter(([, v]) => !!v) as [string, string][];
-    // Sort by preferred order then alphabetically
+    if (!artifactUrls) return [] as [string, string][];
+    const entries = Object.entries(artifactUrls).filter(([, v]) => !!v) as [string, string][];
     entries.sort((a, b) => {
       const ai = ORDER.indexOf(a[0]);
       const bi = ORDER.indexOf(b[0]);
@@ -77,12 +85,22 @@ export default function ArtifactsPanel({ artifacts, className, title = "Artifact
       return a[0].localeCompare(b[0]);
     });
     return entries;
-  }, [artifacts]);
+  }, [artifactUrls]);
 
-  // Validate which artifact URLs actually exist (HEAD)
+  // If flags are provided, trust them (no HEAD).
+  const [headExists, setHeadExists] = React.useState<Record<string, boolean>>({});
   React.useEffect(() => {
+    // Only HEAD when flags are not present (back-compat fallback).
+    if (artifactFlags) {
+      setHeadExists({});
+      return;
+    }
+    if (!pairs.length) {
+      setHeadExists({});
+      return;
+    }
     const ctrl = new AbortController();
-    async function validate() {
+    (async () => {
       const res: Record<string, boolean> = {};
       await Promise.all(
         pairs.map(async ([k, url]) => {
@@ -94,17 +112,22 @@ export default function ArtifactsPanel({ artifacts, className, title = "Artifact
           }
         })
       );
-      if (!ctrl.signal.aborted) setExisting(res);
-    }
-    if (pairs.length) validate();
-    else setExisting({});
+      if (!ctrl.signal.aborted) setHeadExists(res);
+    })();
     return () => ctrl.abort();
-  }, [pairs]);
+  }, [pairs, artifactFlags]);
 
-  const visible = React.useMemo(
-    () => pairs.filter(([k]) => existing[k]),
-    [pairs, existing]
-  );
+  // Decide visibility: prefer flags, else HEAD results, else show nothing.
+  const visible = React.useMemo(() => {
+    if (!pairs.length) return [] as [string, string][];
+    if (artifactFlags) {
+      return pairs.filter(([k]) => !!artifactFlags[k]);
+    }
+    if (Object.keys(headExists).length) {
+      return pairs.filter(([k]) => !!headExists[k]);
+    }
+    return []; // conservative default
+  }, [pairs, artifactFlags, headExists]);
 
   const copy = React.useCallback(async (k: string, v: string) => {
     try {
@@ -127,13 +150,14 @@ export default function ArtifactsPanel({ artifacts, className, title = "Artifact
             const ext = getExt(url);
             const canDownload = DL_EXTS.has(ext);
             const filename = suggestFilename(url, k);
+            const isPartial = k === "overlay_json_partial";
 
             return (
               <li key={k} className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-sm text-slate-300">
                     {LABELS[k] || k}
-                    {k === "overlay_json_partial" && (
+                    {isPartial && (
                       <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] bg-amber-500/10 text-amber-300 border border-amber-600/40">
                         partial
                       </span>
