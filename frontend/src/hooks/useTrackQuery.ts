@@ -4,9 +4,7 @@ import { buildFieldCatalog, flattenTrack, FieldDef } from "@/utils/fields";
 import type { Track } from "@/utils/types";
 import type { FilterPredicate, SortSpec } from "@/utils/viewerTypes";
 
-/**
- * Coerce to number if possible; otherwise return NaN.
- */
+/** Coerce to number if possible; otherwise return NaN. */
 function toNum(v: unknown): number {
   if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
   if (typeof v === "string" && v.trim() !== "") {
@@ -14,10 +12,6 @@ function toNum(v: unknown): number {
     return Number.isFinite(n) ? n : NaN;
   }
   return NaN;
-}
-
-function isFiniteNum(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v);
 }
 
 function cmpAsc(a: any, b: any): number {
@@ -70,7 +64,6 @@ function compilePredicate(fp: FilterPredicate): (row: Record<string, any>) => bo
 
   if (op === "in" || op === "notIn") {
     const raw = Array.isArray(fp.value) ? fp.value : [fp.value];
-    // Build both string and numeric sets; we'll try numeric first if value is numeric-like.
     setStr = new Set(raw.map((x) => String(x)));
     const nums = raw.map((x) => toNum(x)).filter((n) => Number.isFinite(n));
     setNum = nums.length ? new Set(nums) : null;
@@ -100,7 +93,6 @@ function compilePredicate(fp: FilterPredicate): (row: Record<string, any>) => bo
     case "==":
       return (row) => {
         const a = row[field];
-        // If both numeric-like, compare as numbers; else strict string equality
         const an = toNum(a);
         if (Number.isFinite(an) && Number.isFinite(v1n)) return an === v1n;
         return String(a) === v1s;
@@ -149,22 +141,74 @@ function compilePredicate(fp: FilterPredicate): (row: Record<string, any>) => bo
   }
 }
 
+type Options = {
+  /** Resolve values for non-track fields (e.g. "csv.Column"). */
+  extraFieldResolver?: (track: Track, path: string) => any;
+  /** Merge additional fields into the returned catalog (e.g. CSV-driven FieldDefs). */
+  externalCatalog?: FieldDef[];
+};
+
 /**
  * Hook that builds a field catalog, compiles filter/sort, and returns filtered tracks.
- * It memoizes a flattened representation of each track for speed.
+ * It memoizes a flattened representation of each track for speed and (optionally)
+ * augments only the *referenced* fields via `extraFieldResolver`.
  */
 export function useTrackQuery(
   tracks: Track[] | any[],
   filters: FilterPredicate[] = [],
-  sort: SortSpec[] = []
+  sort: SortSpec[] = [],
+  options?: Options
 ) {
-  // Build a catalog (field list) for UI/editor usage
-  const catalog: FieldDef[] = React.useMemo(() => buildFieldCatalog(tracks), [tracks]);
+  // Merge catalog: native track fields + any external FieldDefs (e.g., csv.*)
+  const catalog: FieldDef[] = React.useMemo(() => {
+    const base = buildFieldCatalog(tracks);
+    const extra = options?.externalCatalog ?? [];
+    if (!extra.length) return base;
+    const seen = new Set(base.map((d) => d.path));
+    const merged = base.slice();
+    for (const d of extra) {
+      if (!seen.has(d.path)) {
+        merged.push(d);
+        seen.add(d.path);
+      }
+    }
+    return merged;
+  }, [tracks, options?.externalCatalog]);
 
-  // Flatten all tracks once (memoized)
+  // Which fields are needed right now (for fast augmenting via extraFieldResolver)
+  const usedFields = React.useMemo(() => {
+    const s = new Set<string>();
+    for (const f of filters ?? []) s.add(f.field);
+    for (const srt of sort ?? []) s.add(srt.field);
+    return s;
+  }, [filters, sort]);
+
+  // Flatten all tracks once (memoized) + augment used fields via resolver
   const flatRows = React.useMemo(() => {
-    // flattenTrack returns a map of dottedPath -> value for a single track
-    return tracks.map((t) => flattenTrack(t));
+    const rows = tracks.map((t) => flattenTrack(t));
+    if (options?.extraFieldResolver && usedFields.size) {
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i] as Track;
+        const row = rows[i];
+        for (const f of usedFields) {
+          if (row[f] === undefined) {
+            try {
+              row[f] = options.extraFieldResolver(t, f);
+            } catch {
+              row[f] = undefined;
+            }
+          }
+        }
+      }
+    }
+    return rows;
+  }, [tracks, usedFields, options?.extraFieldResolver]);
+
+  // Track → index lookups (for a quick ‘filterFnTrack’)
+  const indexByRef = React.useMemo(() => {
+    const wm = new WeakMap<object, number>();
+    for (let i = 0; i < tracks.length; i++) wm.set(tracks[i] as object, i);
+    return wm;
   }, [tracks]);
 
   // Compile filters once
@@ -173,6 +217,21 @@ export function useTrackQuery(
     const compiled = filters.map(compilePredicate);
     return (row: Record<string, any>) => compiled.every((fn) => fn(row));
   }, [filters]);
+
+  // Track-level predicate (for OverlayCanvas)
+  const filterFnTrack = React.useMemo(() => {
+    if (!filters?.length) return (_t: Track) => true;
+    const compiled = filters.map(compilePredicate);
+    return (t: Track) => {
+      const idx = indexByRef.get(t as unknown as object);
+      if (idx == null) return true; // if not found, don't filter it out
+      const row = flatRows[idx];
+      for (const fn of compiled) {
+        if (!fn(row)) return false;
+      }
+      return true;
+    };
+  }, [filters, flatRows, indexByRef]);
 
   // Compile sort comparator once
   const sortFn = React.useMemo(() => {
@@ -200,11 +259,16 @@ export function useTrackQuery(
       if (filterFn(flatRows[i])) idxs.push(i);
     }
     if (sortFn) idxs.sort(sortFn);
-    // materialize the final list
     return idxs.map((i) => tracks[i]);
   }, [tracks, flatRows, filterFn, sortFn]);
 
-  return { catalog, filteredTracks, filterFn, sortFn };
+  return {
+    catalog,
+    filteredTracks,
+    filterFn,       // row-based (Record<string, any>) → boolean
+    filterFnTrack,  // track-based (Track) → boolean  ← pass this to OverlayCanvas
+    sortFn,
+  };
 }
 
 export default useTrackQuery;
