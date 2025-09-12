@@ -61,76 +61,61 @@ export default function ColorRuleEditor({
 
   return (
     <div className={`flex flex-col gap-2 ${className || ""}`}>
-      {rules.length === 0 && (
-        <div className="text-xs text-slate-400">No color rules. Add one below.</div>
-      )}
+      {rules.length === 0 && <div className="text-xs text-slate-400">No color rules. Add one below.</div>}
+
       {rules.map((r, idx) => {
         const field = fields.find((f) => f.path === r.when.field) ?? fields[0];
         const ops = opsForKind(field.kind);
-
-        // If op is no longer valid for new kind, coerce to a sensible default
-        const op = (ops as readonly string[]).includes(r.when.op)
-        ? r.when.op
-        : ops[0];
+        const op = (ops as readonly string[]).includes(r.when.op) ? r.when.op : ops[0];
 
         return (
           <div
             key={idx}
-            className="grid grid-cols-[1fr,130px,1fr,1fr,150px,auto] items-center gap-2"
+            className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr),110px,minmax(0,1fr),minmax(0,1fr),minmax(0,150px),auto] items-center gap-2"
           >
             {/* field */}
             <select
-              className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+              className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
               value={r.when.field}
               onChange={(e) => updateWhen(idx, { field: e.target.value })}
               title={field.path}
             >
-              {fields.map((f) => (
-                <option key={f.path} value={f.path}>
-                  {f.label}
-                </option>
-              ))}
+              {fields.map((f) => <option key={f.path} value={f.path}>{f.label}</option>)}
             </select>
 
             {/* op */}
             <select
-              className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+              className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
               value={op as string}
               onChange={(e) => updateWhen(idx, { op: e.target.value as any })}
             >
-              {ops.map((o) => (
-                <option key={o} value={o}>
-                  {o}
-                </option>
-              ))}
+              {ops.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
 
             {/* values */}
             {field.kind === "number" && op === "between" ? (
               <>
                 <input
-                  type="number"
-                  step="any"
-                  className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+                  type="number" step="any"
+                  className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
                   value={String(r.when.value ?? "")}
                   onChange={(e) => updateWhen(idx, { value: Number(e.target.value) })}
                   placeholder="min"
                 />
                 <input
-                  type="number"
-                  step="any"
-                  className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+                  type="number" step="any"
+                  className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
                   value={String(r.when.value2 ?? "")}
                   onChange={(e) => updateWhen(idx, { value2: Number(e.target.value) })}
                   placeholder="max"
                 />
               </>
             ) : field.kind === "boolean" ? (
-              <div className="text-xs text-slate-400 col-span-2">No value</div>
+              <div className="text-xs text-slate-400 md:col-span-2">No value</div>
             ) : op === "in" || op === "notIn" ? (
               <input
                 type="text"
-                className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm col-span-2"
+                className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm md:col-span-2"
                 value={Array.isArray(r.when.value) ? r.when.value.join(", ") : String(r.when.value ?? "")}
                 onChange={(e) => updateWhen(idx, { value: parseList(e.target.value) })}
                 placeholder="a, b, c"
@@ -138,7 +123,7 @@ export default function ColorRuleEditor({
             ) : (
               <input
                 type="text"
-                className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm col-span-2"
+                className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm md:col-span-2"
                 value={String(r.when.value ?? "")}
                 onChange={(e) => updateWhen(idx, { value: e.target.value })}
                 placeholder="value…"
@@ -146,7 +131,7 @@ export default function ColorRuleEditor({
             )}
 
             {/* color */}
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 min-w-0">
               <input
                 type="color"
                 className="h-8 w-8 rounded border border-slate-600 bg-slate-900/60"
@@ -156,7 +141,7 @@ export default function ColorRuleEditor({
               />
               <input
                 type="text"
-                className="flex-1 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+                className="w-full min-w-0 bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
                 value={r.color}
                 onChange={(e) => update(idx, { color: e.target.value })}
                 placeholder="#3b82f6 or hsl(...)"
@@ -165,7 +150,7 @@ export default function ColorRuleEditor({
 
             <button
               type="button"
-              className="px-2 py-1 rounded border border-slate-600 text-slate-300 hover:bg-slate-800 text-xs"
+              className="justify-self-start md:justify-self-auto px-2 py-1 rounded border border-slate-600 text-slate-300 hover:bg-slate-800 text-xs"
               onClick={() => remove(idx)}
             >
               Remove
