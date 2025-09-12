@@ -23,7 +23,7 @@ from ..utils import (
 )
 from ..io.table_to_heatmap import table_to_heatmap
 from ..signal.detrend import detrend_residual
-from ..signal.peaks import detect_peaks
+from ..signal.peaks import detect_peaks, detect_peaks_adaptive
 from ..signal.period import estimate_dominant_frequency, frequency_to_period
 
 from ..extract import _build_kymo_runner as _select_kymo_backend
@@ -116,7 +116,27 @@ def _sort_waves(df: pd.DataFrame) -> pd.DataFrame:
         ignore_index=True,
     )
 
+def _sort_peaks(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["Track"] = pd.to_numeric(df["Track"], errors="coerce").astype("Int64")
+    # Prefer sorting by Peak frame if present; tie-break by amplitude desc if exists
+    sort_cols = ["Track"]
+    ascending = [True]
+    if "Peak frame" in df.columns:
+        sort_cols.append("Peak frame")
+        ascending.append(True)
+    if "Amplitude (pixels)" in df.columns:
+        sort_cols.append("Amplitude (pixels)")
+        ascending.append(False)
+    return df.sort_values(sort_cols, kind="mergesort", ascending=ascending, ignore_index=True)
+
 def _overlay_track_from_array(arr_path: Path, cfg: dict):
+    """
+    Build a minimal overlay track payload using the SAME (adaptive) peak logic
+    as extract.py (falls back to legacy if disabled or period unknown).
+    """
     detrend_cfg = cfg.get("detrend", {}) or {}
     peaks_cfg = cfg.get("peaks", {}) or {}
     period_cfg = (cfg.get("period", {}) or {}).copy()
@@ -129,7 +149,6 @@ def _overlay_track_from_array(arr_path: Path, cfg: dict):
     y = xy[:, 1].astype(float)
 
     residual = detrend_residual(x, y, **detrend_cfg)
-    peaks_idx, _ = detect_peaks(residual, **peaks_cfg)
 
     # Frequency and period (guard against non-finite)
     freq = estimate_dominant_frequency(residual, **period_cfg)
@@ -138,6 +157,29 @@ def _overlay_track_from_array(arr_path: Path, cfg: dict):
     except Exception:
         freq = float("nan")
     period = frequency_to_period(freq) if (isinstance(freq, (int, float)) and math.isfinite(freq) and freq > 0) else float("nan")
+
+    frames_per_period = (sampling_rate / freq) if (sampling_rate and isinstance(freq, (int, float)) and math.isfinite(freq) and freq > 0) else None
+
+    # Adaptive by default (match extract.py), else legacy
+    if bool(peaks_cfg.get("adaptive", True)) and frames_per_period is not None:
+        peaks_idx, _ = detect_peaks_adaptive(
+            residual,
+            frames_per_period=frames_per_period,
+            distance_frac=float(peaks_cfg.get("distance_frac", 0.6)),
+            width_frac=float(peaks_cfg.get("width_frac", 0.2)),
+            rel_mad_k=float(peaks_cfg.get("rel_mad_k", 2.0)),
+            abs_min_prom_px=float(peaks_cfg.get("abs_min_prom_px", 1.0)),
+            nms_enable=bool(peaks_cfg.get("nms_enable", True)),
+            nms_dominance_frac=float(peaks_cfg.get("nms_dominance_frac", 0.55)),
+        )
+    else:
+        legacy_kwargs = {
+            "prominence": float(peaks_cfg.get("prominence", 1.0)),
+            "width": float(peaks_cfg.get("width", 1.0)),
+        }
+        if peaks_cfg.get("distance", None) is not None:
+            legacy_kwargs["distance"] = int(peaks_cfg["distance"])
+        peaks_idx, _ = detect_peaks(residual, **legacy_kwargs)
 
     # Amplitude (guard)
     amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
@@ -153,7 +195,7 @@ def _overlay_track_from_array(arr_path: Path, cfg: dict):
     track = {
         "id": arr_path.stem,
         "sample": _sample_name_from_arr_path(arr_path),
-        "poly": xy.astype(float).tolist(),   # keep as-is; assumed finite from extraction
+        "poly": xy.astype(float).tolist(),   # keep as-is
         "peaks": [int(i) for i in peaks_idx.tolist()],
         "metrics": metrics,
     }
@@ -174,7 +216,7 @@ def _finalize_overlay_from_ndjson(ndjson_path: Path, final_json_path: Path) -> N
                 if not s:
                     continue
                 try:
-                    obj = json.loads(s)      # may contain NaN from older runs
+                    obj = json.loads(s)
                 except Exception:
                     continue
                 tracks.append(_sanitize_for_json(obj))
@@ -190,6 +232,10 @@ def _build_overlay_json(
     *,
     log=None,
 ) -> Path:
+    """
+    One-shot overlay builder (unused during streaming runs, kept for completeness).
+    Uses adaptive peaks when possible to match extract.py.
+    """
     detrend_cfg = cfg.get("detrend", {}) or {}
     peaks_cfg = cfg.get("peaks", {}) or {}
     period_cfg = (cfg.get("period", {}) or {}).copy()
@@ -206,21 +252,46 @@ def _build_overlay_json(
             y = xy[:, 1].astype(float)
 
             residual = detrend_residual(x, y, **detrend_cfg)
-            peaks_idx, _ = detect_peaks(residual, **peaks_cfg)
-            freq = float(estimate_dominant_frequency(residual, **period_cfg))
-            period = float(frequency_to_period(freq))
+            freq = estimate_dominant_frequency(residual, **period_cfg)
+            try:
+                freq = float(freq)
+            except Exception:
+                freq = float("nan")
+            period = frequency_to_period(freq) if (isinstance(freq, (int, float)) and math.isfinite(freq) and freq > 0) else float("nan")
+
+            frames_per_period = (sampling_rate / freq) if (sampling_rate and isinstance(freq, (int, float)) and math.isfinite(freq) and freq > 0) else None
+
+            if bool(peaks_cfg.get("adaptive", True)) and frames_per_period is not None:
+                peaks_idx, _ = detect_peaks_adaptive(
+                    residual,
+                    frames_per_period=frames_per_period,
+                    distance_frac=float(peaks_cfg.get("distance_frac", 0.6)),
+                    width_frac=float(peaks_cfg.get("width_frac", 0.2)),
+                    rel_mad_k=float(peaks_cfg.get("rel_mad_k", 2.0)),
+                    abs_min_prom_px=float(peaks_cfg.get("abs_min_prom_px", 1.0)),
+                    nms_enable=bool(peaks_cfg.get("nms_enable", True)),
+                    nms_dominance_frac=float(peaks_cfg.get("nms_dominance_frac", 0.55)),
+                )
+            else:
+                legacy_kwargs = {
+                    "prominence": float(peaks_cfg.get("prominence", 1.0)),
+                    "width": float(peaks_cfg.get("width", 1.0)),
+                }
+                if peaks_cfg.get("distance", None) is not None:
+                    legacy_kwargs["distance"] = int(peaks_cfg["distance"])
+                peaks_idx, _ = detect_peaks(residual, **legacy_kwargs)
 
             amps = residual[peaks_idx] if len(peaks_idx) > 0 else np.array([])
             metrics = {
-                "dominant_frequency": freq,
-                "period": period,
+                "dominant_frequency": float(freq) if math.isfinite(freq) else float("nan"),
+                "period": float(period) if math.isfinite(period) else float("nan"),
                 "num_peaks": int(len(peaks_idx)),
                 "mean_amplitude": float(np.mean(amps)) if amps.size > 0 else float("nan"),
             }
             payload["tracks"].append({
                 "id": Path(arr).stem,
                 "sample": _sample_name_from_arr_path(arr),
-                "poly": xy.astype(float).tolist(),      # [[y,x],...]
+                "poly": xy.astype(float).tolist(),
                 "peaks": [int(i) for i in peaks_idx.tolist()],
                 "metrics": metrics,
             })
@@ -233,6 +304,85 @@ def _build_overlay_json(
         json.dump(payload, f)
     return save_path
 
+# -----------------------
+# Debug asset helpers (NEW)
+# -----------------------
+
+def _append_debug_ndjson_line(path: Path, obj: dict) -> None:
+    obj = _sanitize_for_json(obj)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, allow_nan=False) + "\n")
+
+def _finalize_debug_from_ndjson(ndjson_path: Path, final_json_path: Path) -> None:
+    items = []
+    if ndjson_path.exists():
+        with ndjson_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                items.append(_sanitize_for_json(obj))
+    payload = _sanitize_for_json({"version": 1, "items": items})
+    final_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with final_json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, allow_nan=False)
+
+def _copy_debug_assets(base_dir: Path, overlay_dir: Path, output_root: Path, *, img_name: str) -> Optional[dict]:
+    """
+    Copy per-image debug files produced by kb_adapter into output/overlay/debug/<stem>/,
+    and return a small record describing their relative paths for UI consumption.
+    """
+    src_dbg = base_dir / "debug"
+    if not src_dbg.exists():
+        return None
+
+    dest_dir = overlay_dir / "debug" / base_dir.name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # expected files (best-effort)
+    file_map = {
+        "prob": "prob.png",
+        "mask_raw": "mask_raw.png",
+        "mask_clean": "mask_clean.png",
+        "mask_filtered": "mask_filtered.png",
+        "skeleton": "skeleton.png",
+        "mask_hysteresis": "mask_hysteresis.png",
+        "stats": "stats.txt",
+    }
+
+    files: Dict[str, str] = {}
+    for key, fname in file_map.items():
+        s = src_dbg / fname
+        if s.exists():
+            d = dest_dir / fname
+            try:
+                shutil.copyfile(s, d)
+            except Exception:
+                continue
+            files[key] = str(d.relative_to(output_root).as_posix())
+
+    # overlay_tracks lives one level up from debug/
+    s_overlay = base_dir / "overlay_tracks.png"
+    if s_overlay.exists():
+        d_overlay = dest_dir / "overlay_tracks.png"
+        try:
+            shutil.copyfile(s_overlay, d_overlay)
+            files["overlay_tracks"] = str(d_overlay.relative_to(output_root).as_posix())
+        except Exception:
+            pass
+
+    rec = {
+        "id": base_dir.name,
+        "image_name": img_name,
+        "debug_dir": str(dest_dir.relative_to(output_root).as_posix()),
+        "files": files,
+    }
+    return rec
 
 # -----------------------
 # Core run (generator) — supports cancellation + partial writes + resume
@@ -262,6 +412,11 @@ def iter_run_project(
     input_dir = Path(input_dir)
     output_dir = ensure_dir(output_dir)
     plots_dir = ensure_dir(plots_out) if plots_out else None
+
+    # Prepare overlay dir & debug NDJSON EARLY (used during KYMO)
+    overlay_dir = ensure_dir(Path(output_dir) / "overlay")
+    debug_ndjson = overlay_dir / "debug.ndjson"         # streamed (append-per-image)
+    debug_final_json = overlay_dir / "debug_index.json" # finalized at end
 
     # Load/merge config
     cfg = load_config(config_path)
@@ -401,7 +556,7 @@ def iter_run_project(
             # Copy the first image as base.png for the viewer (once)
             if not base_image_written:
                 try:
-                    (output_dir / "overlay").mkdir(parents=True, exist_ok=True)  # ensure dir exists
+                    (output_dir / "overlay").mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(img, output_dir / "base.png")
                     base_image_written = True
                 except Exception:
@@ -412,6 +567,14 @@ def iter_run_project(
             found = sorted(out_dir.glob(track_glob))
             arr_paths_all.extend(found)
             produced += len(found)
+
+            # NEW: copy & index debug assets for this image (streamed)
+            try:
+                rec = _copy_debug_assets(base_dir, overlay_dir, output_dir, img_name=img.name)
+                if rec:
+                    _append_debug_ndjson_line(debug_ndjson, rec)
+            except Exception as e:
+                get_logger("pipeline.debug").debug(f"debug assets copy failed for {img}: {e}")
 
             evt = JobEvent(
                 "KYMO",
@@ -452,7 +615,7 @@ def iter_run_project(
         )
         _emit(progress_cb, evt); yield evt
 
-    # analysis (tracks + waves) and plots
+    # analysis (tracks + waves + peaks) and plots
     viz_cfg = cfg.get("viz", {}) or {}
     viz_enabled = bool(viz_cfg.get("enabled", True))
     per_track_cfg = viz_cfg.get("per_track", {}) or {}
@@ -477,13 +640,13 @@ def iter_run_project(
     overlay_cfg = (service_cfg.get("overlay") or {})
     overlay_every = int(overlay_cfg.get("write_every_tracks", 1))
 
-    overlay_dir = ensure_dir(Path(output_dir) / "overlay")
     overlay_ndjson = overlay_dir / "tracks.ndjson"
     overlay_partial_json = overlay_dir / "tracks.partial.json"  # optional (we can skip writing this)
     overlay_final_json = overlay_dir / "tracks.json"
 
     track_results: List[dict] = []
     wave_results: List[dict] = []
+    peak_results: List[dict] = []
 
     # Conditionally pass new wave-window limits if process_track supports them
     pt_params = set(inspect.signature(_process_track).parameters.keys())
@@ -503,6 +666,7 @@ def iter_run_project(
         """Write partial CSVs only; overlay is maintained via NDJSON appends."""
         tracks_csv = tracks_out / "metrics.partial.csv"
         waves_csv = tracks_out / "metrics_waves.partial.csv"
+        peaks_csv = tracks_out / "metrics_peaks.partial.csv"
 
         df_tracks = pd.DataFrame(track_results)
         if not df_tracks.empty:
@@ -521,9 +685,19 @@ def iter_run_project(
         else:
             waves_csv = None
 
+        df_peaks = pd.DataFrame(peak_results)
+        if not df_peaks.empty:
+            df_peaks = _sort_peaks(df_peaks)
+            tmpp = peaks_csv.with_suffix(".tmp")
+            df_peaks.to_csv(tmpp, index=False, na_rep="NA")
+            tmpp.replace(peaks_csv)
+        else:
+            peaks_csv = None
+
         extra = {"overlay_ndjson": str(overlay_ndjson)}
         if tracks_csv: extra["tracks_partial"] = str(tracks_csv)
         if waves_csv:  extra["waves_partial"] = str(waves_csv)
+        if peaks_csv:  extra["peaks_partial"] = str(peaks_csv)
         return extra
 
     evt = JobEvent("PROCESS", f"Processing {total_tracks} track(s)", 0.60)
@@ -539,7 +713,7 @@ def iter_run_project(
             yield JobEvent("CANCELLED", f"Run cancelled at {len(processed_indices)}/{total_tracks}", 1.0, extra=extra)
             return
         try:
-            metrics, waves = _process_track(
+            metrics, waves, peaks = _process_track(
                 arr,
                 detrend_cfg,
                 peaks_cfg,
@@ -554,6 +728,7 @@ def iter_run_project(
             )
             track_results.append(metrics)
             wave_results.extend(waves)
+            peak_results.extend(peaks)
 
             # mark as done for resume
             try:
@@ -613,9 +788,10 @@ def iter_run_project(
         yield JobEvent("CANCELLED", "Run cancelled after processing", 1.0, extra=extra)
         return
 
-    # write CSVs (+ sort waves)
+    # write CSVs (+ sort waves/peaks)
     tracks_csv = tracks_out / "metrics.csv"
     waves_csv = tracks_out / "metrics_waves.csv"
+    peaks_csv = tracks_out / "metrics_peaks.csv"
 
     df_tracks = pd.DataFrame(track_results)
     save_dataframe(df_tracks, tracks_csv)
@@ -625,15 +801,16 @@ def iter_run_project(
         df_waves = _sort_waves(df_waves)
         df_waves.to_csv(waves_csv, index=False, na_rep="NA")
     else:
-        df_waves = pd.DataFrame(
-            columns=[
-                "Sample", "Track", "Wave number", "Frame position 1", "Frame position 2",
-                "Period (frames)", "Period (s)", "Frequency (Hz)", "Pixel position 1",
-                "Pixel position 2", "Amplitude (pixels)", "Δposition (px)",
-                "Velocity (px/s)", "Wavelength (px)"
-            ]
-        )
+        df_waves = pd.DataFrame()
         df_waves.to_csv(waves_csv, index=False)
+
+    df_peaks = pd.DataFrame(peak_results)
+    if not df_peaks.empty:
+        df_peaks = _sort_peaks(df_peaks)
+        df_peaks.to_csv(peaks_csv, index=False, na_rep="NA")
+    else:
+        df_peaks = pd.DataFrame()
+        df_peaks.to_csv(peaks_csv, index=False)
 
     # overlay JSON for the viewer (finalize from NDJSON)
     evt = JobEvent("OVERLAY", "Finalizing overlay JSON", 0.88)
@@ -642,8 +819,11 @@ def iter_run_project(
         _finalize_overlay_from_ndjson(overlay_ndjson, overlay_final_json)
     except Exception as e:
         get_logger("pipeline.overlay").exception(f"Finalize overlay failed: {e}")
-    # overlay_json = tracks_out / "overlay" / "tracks.json"
-    #  _build_overlay_json([arr_paths_all[i] for i in sorted(processed_indices)], cfg, overlay_json, log=get_logger("pipeline.overlay"))
+
+    try:
+        _finalize_debug_from_ndjson(debug_ndjson, debug_final_json)  # NEW
+    except Exception as e:
+        get_logger("pipeline.debug").exception(f"Finalize debug index failed: {e}")
 
     # summary histograms (optional)
     if plots_dir is not None and make_summary_hists:
@@ -659,12 +839,16 @@ def iter_run_project(
         "config_path": str(Path(config_path)),
         "output_dir": str(tracks_out),
         "plots_dir": str(plots_dir) if plots_dir else None,
+        "overlay_json": str(overlay_final_json),
+        "debug_index": str(debug_final_json),
         "resume": {
             "enabled": resume_enabled,
             "skipped_count": int(skipped_count),
             "marker_dir": str(marker_dir),
             "progress_file": str(progress_file),
         },
+        # expose peaks artifact for callers that want it
+        "peaks_csv": str(peaks_csv),
     }
     manifest_json = tracks_out / "manifest.json"
     with open(manifest_json, "w") as f:
@@ -676,11 +860,12 @@ def iter_run_project(
     evt = JobEvent("WRITE", "Wrote outputs", 0.96, {
         "tracks_csv": str(tracks_csv),
         "waves_csv": str(waves_csv),
-        "overlay_json": str(overlay_json),
+        "peaks_csv": str(peaks_csv),
+        "overlay_json": str(overlay_final_json),
+        "debug_index": str(debug_final_json),
         "manifest": str(manifest_json),
         "base_image": str(output_dir / "base.png") if (output_dir / "base.png").exists() else None,
     })
     _emit(progress_cb, evt); yield evt
 
     yield JobEvent("DONE", "Pipeline complete", 1.0)
-
