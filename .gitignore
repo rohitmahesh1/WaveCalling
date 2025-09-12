@@ -32,6 +32,9 @@ export/
 # ignore runs/
 runs/
 
+# ignore files/ (temporarily)
+files/
+
 # frontend-related files
 node_modules
 dist
