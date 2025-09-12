@@ -9,6 +9,7 @@ import FilterRuleEditor from "@/components/viewer/FilterRuleEditor";
 import ColorRuleEditor from "@/components/viewer/ColorRuleEditor";
 import SortRuleEditor from "@/components/viewer/SortRuleEditor";
 import { downloadJSON } from "@/utils/download";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
 
 type Props = {
   /** Full (unfiltered) track list so we can infer fields for editors */
@@ -46,6 +47,17 @@ type Props = {
   onClearSelection?: () => void;
 };
 
+const RECOMMENDED_PATHS = new Set<string>([
+  "metrics.mean_amplitude",
+  "metrics.dominant_frequency",
+  "metrics.num_peaks",
+  "metrics.period",
+  "points",
+  "peaks_count",
+  "sample",
+  "id",
+]);
+
 export default function AdvancedSidePanel({
   tracks,
 
@@ -67,8 +79,19 @@ export default function AdvancedSidePanel({
   selectedTrack,
   onClearSelection,
 }: Props) {
-  // Build catalog from tracks (flattened fields with types/enums)
-  const catalog: FieldDef[] = React.useMemo(() => buildFieldCatalog(tracks ?? []), [tracks]);
+  // Build full catalog from tracks (flattened fields with types/enums)
+  const fullCatalog: FieldDef[] = React.useMemo(() => buildFieldCatalog(tracks ?? []), [tracks]);
+
+  // Toggle: show concise set vs all fields (persist this choice)
+  const [showAllFields, setShowAllFields] = useLocalStorage<boolean>("viewer:moreFields", false);
+
+  // Recommended subset (fall back to full if we somehow filter everything out)
+  const recommendedCatalog = React.useMemo(() => {
+    const picked = fullCatalog.filter((f) => RECOMMENDED_PATHS.has(f.path));
+    return picked.length ? picked : fullCatalog;
+  }, [fullCatalog]);
+
+  const catalog = showAllFields ? fullCatalog : recommendedCatalog;
 
   // ---- Presets ----
   const addPresetAmplitude = React.useCallback(() => {
@@ -98,28 +121,28 @@ export default function AdvancedSidePanel({
   }, [selectedTrack]);
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 min-w-[500px]">
       {/* Downloads */}
-      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
-        <div className="flex items-center justify-between">
+      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <h4 className="text-slate-200 font-semibold">Download</h4>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-2">
           <button
-            className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
+            className="cursor-pointer px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
             onClick={onDownloadPNG}
           >
             Canvas PNG
           </button>
           <button
-            className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
+            className="cursor-pointer px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
             onClick={onDownloadJSON}
           >
             Tracks JSON
           </button>
           {onDownloadCSV && (
             <button
-              className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
+              className="cursor-pointer px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
               onClick={onDownloadCSV}
             >
               Tracks CSV
@@ -129,19 +152,27 @@ export default function AdvancedSidePanel({
       </section>
 
       {/* Filters */}
-      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
-        <div className="flex items-center justify-between">
+      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <h4 className="text-slate-200 font-semibold">Filters</h4>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            <label className="inline-flex items-center gap-2 text-xs text-slate-300">
+              <input
+                type="checkbox"
+                checked={showAllFields}
+                onChange={(e) => setShowAllFields(e.target.checked)}
+              />
+              More fields
+            </label>
             <button
-              className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+              className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
               onClick={addPresetAmplitude}
               title="Add preset: metrics.mean_amplitude > 30"
             >
               + amp &gt; 30
             </button>
             <button
-              className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+              className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
               onClick={clearFilters}
               title="Clear all filters"
             >
@@ -160,19 +191,19 @@ export default function AdvancedSidePanel({
       </section>
 
       {/* Color rules */}
-      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
-        <div className="flex items-center justify-between">
+      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <h4 className="text-slate-200 font-semibold">Color rules</h4>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <button
-              className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+              className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
               onClick={addPresetLowFreqBlue}
               title="Add preset: metrics.dominant_frequency < 20 → blue"
             >
               + freq &lt; 20 → blue
             </button>
             <button
-              className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+              className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
               onClick={clearRules}
               title="Clear all rules"
             >
@@ -192,12 +223,12 @@ export default function AdvancedSidePanel({
 
       {/* Sorting */}
       {onSortChange && (
-        <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
-          <div className="flex items-center justify-between">
+        <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
             <h4 className="text-slate-200 font-semibold">Sorting</h4>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
-                className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+                className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
                 onClick={() => onSortChange([])}
                 title="Clear all sort criteria"
               >
@@ -217,7 +248,7 @@ export default function AdvancedSidePanel({
       )}
 
       {/* Stats */}
-      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
+      <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
         <h4 className="text-slate-200 font-semibold">Stats</h4>
         <div className="mt-2">
           <StatsSummary
@@ -231,19 +262,19 @@ export default function AdvancedSidePanel({
 
       {/* Selection echo (compact) */}
       {selectedTrack && (
-        <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3">
-          <div className="flex items-center justify-between">
+        <section className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-3 overflow-x-auto">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
             <h4 className="text-slate-200 font-semibold">Selection</h4>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
-                className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+                className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
                 onClick={downloadSelectedJSON}
               >
                 Save JSON
               </button>
               {onClearSelection && (
                 <button
-                  className="px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
+                  className="cursor-pointer px-2 py-1 rounded border text-xs border-slate-600 text-slate-300 hover:bg-slate-800"
                   onClick={onClearSelection}
                 >
                   Clear
