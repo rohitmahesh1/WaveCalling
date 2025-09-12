@@ -2,7 +2,7 @@
 import * as React from "react";
 import { useApiBase } from "@/context/ApiContext";
 import { DashboardProvider, useDashboard } from "@/context/DashboardContext";
-import { useSSE } from "@/hooks/useSSE";
+import { useSSE, type BackendEvent } from "@/hooks/useSSE";
 
 import RunsPanel from "@/components/RunsPanel";
 import UploadPanel from "@/components/UploadPanel";
@@ -19,27 +19,9 @@ import type { JobEvent } from "@/utils/types";
 import { cancelRun, resumeRun } from "@/utils/api";
 
 /**
- * Configure phases here.
- * - EXCLUDED_PHASES: phases hidden from the log (still allowed to refresh UI).
- * - PROGRESS_REFRESH_PHASES / OVERLAY_REFRESH_PHASES: phases that trigger throttled refreshes.
+ * Configure phases here (logging only; refreshes are SSE-driven now).
  */
-const EXCLUDED_PHASES = new Set<string>([
-  "WRITE_PARTIAL",
-  "DISCOVER",
-]);
-
-const PROGRESS_REFRESH_PHASES = new Set<string>([
-  "KYMO",
-  "WRITE_PARTIAL",
-  "DISCOVER",
-]);
-
-const OVERLAY_REFRESH_PHASES = new Set<string>([
-  "WRITE_PARTIAL",
-  "OVERLAY",
-  "WRITE",
-  "DISCOVER",
-]);
+const EXCLUDED_PHASES = new Set<string>(["WRITE_PARTIAL", "DISCOVER"]);
 
 const RUN_ID_RE = /^[a-f0-9]{6,32}$/i;
 const pauseKey = (runId: string) => `log:paused:${runId}`;
@@ -54,14 +36,23 @@ function sanitizeRunId(v: unknown): string | null {
   return s;
 }
 
-// throttle helper
+// Simple leading+trailing throttle
 function useThrottle(fn: () => void, minMs: number) {
   const lastRef = React.useRef(0);
+  const scheduledRef = React.useRef<number | null>(null);
   return React.useCallback(() => {
     const now = Date.now();
-    if (now - lastRef.current >= minMs) {
+    const since = now - lastRef.current;
+    if (since >= minMs) {
       lastRef.current = now;
       fn();
+    } else if (scheduledRef.current == null) {
+      const delay = minMs - since;
+      scheduledRef.current = window.setTimeout(() => {
+        scheduledRef.current = null;
+        lastRef.current = Date.now();
+        fn();
+      }, delay) as unknown as number;
     }
   }, [fn, minMs]);
 }
@@ -93,9 +84,7 @@ function DashboardInner() {
   } = useDashboard();
 
   const safeRunId = React.useMemo(() => sanitizeRunId(selectedRunId), [selectedRunId]);
-
   const [overridesJson, setOverridesJson] = React.useState<string>("");
-
 
   // Toggle SSE on/off to prevent reconnect after terminal
   const [sseEnabled, setSseEnabled] = React.useState(true);
@@ -109,8 +98,7 @@ function DashboardInner() {
   );
 
   // --- Paused state: persisted per run, with smart default ---
-  const [logPaused, _setLogPaused] = React.useState<boolean>(true); // default true until we decide
-  // Wrap setter to persist for current run id
+  const [logPaused, _setLogPaused] = React.useState<boolean>(true);
   const setLogPaused = React.useCallback(
     (v: boolean) => {
       _setLogPaused(v);
@@ -123,9 +111,6 @@ function DashboardInner() {
     [safeRunId]
   );
 
-  // On run change or status change, initialize paused:
-  // 1) use saved value if present
-  // 2) else derive from status (RUNNING/QUEUED => not paused, otherwise paused)
   React.useEffect(() => {
     if (!safeRunId) return;
     let stored: string | null = null;
@@ -141,39 +126,47 @@ function DashboardInner() {
     _setLogPaused(!active);
   }, [safeRunId, selectedInfo?.status]);
 
-  const { status: sseStatus, last, reconnect, close } = useSSE<JobEvent>({
+  // Throttle the actual network work (belt & suspenders in addition to the hook's internal gating)
+  const refreshOverlayThrottled = useThrottle(() => { void refreshOverlay(); }, 1200);
+  const refreshProgressThrottled = useThrottle(() => { void refreshProgress(); }, 2500);
+
+  // SSE: event-driven refresh wiring (coalesce bursts)
+  const { status: sseStatus, last, reconnect, close } = useSSE<BackendEvent>({
     url: sseUrl,
-    withCredentials: false,
     autoReconnect: true,
-    reconnectDelayMs: 800,
-    maxReconnectDelayMs: 10_000,
+    // widen the coalescing window so we *batch* many events into one onDirty
+    coalesceWindowMs: 800,
+    onStatus: (st) => {
+      // auto-stop UI reconnects when terminal
+      if (/^(DONE|ERROR|CANCELLED)$/i.test(st)) setSseEnabled(false);
+    },
+    onDirty: async (flags) => {
+      if (flags.overlay) refreshOverlayThrottled();
+      if (flags.progress) refreshProgressThrottled();
+      // if (flags.snapshot) -> attach a throttled snapshot refresher where you use it
+    },
   });
 
+  // When run changes: enable SSE and do one initial fetch (in case we mounted mid-run)
   React.useEffect(() => {
     if (!safeRunId) return;
-    // re-enable SSE for the new selection
     setSseEnabled(true);
     void refreshProgress();
     void refreshOverlay();
   }, [safeRunId, refreshProgress, refreshOverlay]);
 
-  const refreshOverlayThrottled = useThrottle(() => void refreshOverlay(), 1500);
-  const refreshProgressThrottled = useThrottle(() => void refreshProgress(), 4000);
-
-  // de-dupe & terminal guards
+  // --- Logging (no longer triggers refresh; SSE dirty flags handle that) ---
   const lastLogRef = React.useRef<string>("");
   const lastProcessLogAtRef = React.useRef<number>(0);
   const terminalSeenRef = React.useRef<boolean>(false);
 
   React.useEffect(() => {
     if (!last || !last.data) return;
-    const evt = last.data as JobEvent;
+    const evt = last.data as unknown as JobEvent; // still compatible with our backend payload
     const phase = evt.phase ?? "(event)";
-    const isTerminal =
-      phase === "DONE" || phase === "ERROR" || phase === "CANCELLED";
+    const isTerminal = phase === "DONE" || phase === "ERROR" || phase === "CANCELLED";
     const msgText = `[${phase}] ${evt.message ?? ""}`.trim();
 
-    // Terminal handling once: stop SSE reconnection + log only the main line
     if (isTerminal) {
       if (!terminalSeenRef.current) {
         terminalSeenRef.current = true;
@@ -181,64 +174,45 @@ function DashboardInner() {
           appendLog(msgText);
           lastLogRef.current = msgText;
         }
-        // stop SSE (prevents replay of terminal on reconnect)
+        // The hook will close automatically; keep UI toggle in sync
         setSseEnabled(false);
         close();
-        // one last snapshot (throttled)
-        refreshProgressThrottled();
-        refreshOverlayThrottled();
       }
-      return; // ignore extras for terminal
-    }
-
-    const excluded = EXCLUDED_PHASES.has(phase);
-
-    // If excluded, skip logging but still do throttled UI refreshes if configured
-    if (excluded) {
-      if (PROGRESS_REFRESH_PHASES.has(phase)) refreshProgressThrottled();
-      if (OVERLAY_REFRESH_PHASES.has(phase)) refreshOverlayThrottled();
       return;
     }
 
-    // Normal logging (with rate-limit for PROCESS)
-    if (phase === "PROCESS") {
-      const now = Date.now();
-      if (now - lastProcessLogAtRef.current >= 1500) {
+    // Filtered logging
+    const excluded = EXCLUDED_PHASES.has(phase);
+    if (!excluded) {
+      if (phase === "PROCESS") {
+        const now = Date.now();
+        if (now - lastProcessLogAtRef.current >= 1500) {
+          if (msgText && msgText !== lastLogRef.current) {
+            appendLog(msgText);
+            lastLogRef.current = msgText;
+          }
+          lastProcessLogAtRef.current = now;
+        }
+      } else {
         if (msgText && msgText !== lastLogRef.current) {
           appendLog(msgText);
           lastLogRef.current = msgText;
         }
-        lastProcessLogAtRef.current = now;
       }
-    } else {
-      if (msgText && msgText !== lastLogRef.current) {
-        appendLog(msgText);
-        lastLogRef.current = msgText;
-      }
-    }
 
-    // Extras (only when not excluded)
-    if (evt.extra && typeof evt.extra === "object") {
-      for (const [k, v] of Object.entries(evt.extra)) {
-        if (typeof v === "string" && v.startsWith("/runs/")) {
-          const urlLine = `[${phase}] ${k}: ${v}`;
-          if (urlLine !== lastLogRef.current) {
-            appendLog(urlLine);
-            lastLogRef.current = urlLine;
+      if (evt.extra && typeof evt.extra === "object") {
+        for (const [k, v] of Object.entries(evt.extra)) {
+          if (typeof v === "string" && v.startsWith("/runs/")) {
+            const urlLine = `[${phase}] ${k}: ${v}`;
+            if (urlLine !== lastLogRef.current) {
+              appendLog(urlLine);
+              lastLogRef.current = urlLine;
+            }
           }
         }
       }
     }
-
-    if (PROGRESS_REFRESH_PHASES.has(phase)) refreshProgressThrottled();
-    if (OVERLAY_REFRESH_PHASES.has(phase)) refreshOverlayThrottled();
-  }, [
-    last,
-    appendLog,
-    close,
-    refreshOverlayThrottled,
-    refreshProgressThrottled,
-  ]);
+  }, [last, appendLog, close]);
 
   // Reset guards when run changes
   React.useEffect(() => {
@@ -256,9 +230,7 @@ function DashboardInner() {
         <div className="text-slate-400">Status:</div>
         <RunStatusBadge status={selectedInfo.status} />
         {selectedInfo.error && (
-          <span className="text-rose-300 truncate max-w-[280px]">
-            — {selectedInfo.error}
-          </span>
+          <span className="text-rose-300 truncate max-w-[280px]">— {selectedInfo.error}</span>
         )}
       </div>
     );
@@ -277,10 +249,7 @@ function DashboardInner() {
         </div>
 
         <div className="flex flex-col gap-4">
-          
-          <UploadPanel
-            onStarted={(rid) => setSelectedRunId(rid)} 
-          />
+          <UploadPanel onStarted={(rid) => setSelectedRunId(rid)} />
 
           <div className="rounded-xl border border-slate-700/50 bg-console-700 p-4">
             <div className="flex items-center justify-between gap-2">
@@ -288,9 +257,7 @@ function DashboardInner() {
                 <div className="text-slate-200 font-semibold">Selected</div>
                 <div className="text-xs text-slate-400 mt-1">
                   run_id:{" "}
-                  <span className="text-slate-300 font-mono">
-                    {safeRunId ?? "(none)"}
-                  </span>
+                  <span className="text-slate-300 font-mono">{safeRunId ?? "(none)"}</span>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -335,7 +302,7 @@ function DashboardInner() {
                   options={viewerOptions}
                   onOptionsChange={setViewerOptions}
                   loading={overlayLoading}
-                  onRefresh={() => void refreshOverlay()}
+                  onRefresh={() => void refreshOverlay({ force: true })}
                 />
               </div>
 
@@ -344,7 +311,7 @@ function DashboardInner() {
                 <LiveLogPanel
                   logs={logs}
                   paused={logPaused}
-                  setPaused={setLogPaused} // persists per run
+                  setPaused={setLogPaused}
                   onClear={clearLog}
                   onDownload={downloadLog}
                   onPauseCancel={async () => {
