@@ -90,7 +90,7 @@ def _peak_prop_at_index(peaks_idx: np.ndarray, props: Dict[str, np.ndarray], pea
         return out
     for k, v in props.items():
         try:
-            out[k] = float(v[pos])
+            out[k] = float(np.asarray(v)[pos])
         except Exception:
             pass
     return out
@@ -133,7 +133,7 @@ def anchored_sine_params(
     Fit residual with a fixed frequency sine, PHASE-ANCHORED at center_idx (peak maximum).
     Compute vNMSE inside a window of width = period_frac * period centered on center_idx.
 
-    Returns dict with A, phi, c, f, vnmse, and window [lo, hi] (indices).
+    Returns dict with A, phi, c, f, vNMSE, and window [lo, hi] (indices).
     """
     out = {
         "fit_amp_A": np.nan,
@@ -214,8 +214,135 @@ def classify_wave_type(
 
 
 # -----------------------
-# Row builder
+# Row builders
 # -----------------------
+
+def _local_period_frames_from_peaks(peaks_idx: np.ndarray, k: int) -> Optional[float]:
+    """
+    Estimate local period (in frames) for peak index p[k] using nearby gaps.
+    Uses the median of {p[k]-p[k-1], p[k+1]-p[k]} when available.
+    """
+    p = np.asarray(peaks_idx, dtype=int)
+    if p.size == 0 or k < 0 or k >= p.size:
+        return None
+    gaps: List[float] = []
+    if k - 1 >= 0:
+        gaps.append(float(p[k] - p[k - 1]))
+    if k + 1 < p.size:
+        gaps.append(float(p[k + 1] - p[k]))
+    if not gaps:
+        return None
+    return float(np.median(gaps))
+
+
+def build_peak_rows(
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    residual: np.ndarray,
+    peaks_idx: np.ndarray,
+    peak_props: dict,
+    sampling_rate: float,
+    sample: str,
+    track_stem: str,
+    features_cfg: Optional[dict] = None,
+    global_freq_hz: float | None = None,
+    period_frac_for_fit: float = 0.5,
+) -> List[dict]:
+    """
+    Build one row PER PEAK with:
+      - IDs
+      - peak frame & position, amplitude (residual at peak)
+      - local period (frames,s) from neighbor gaps (fallback to global)
+      - local frequency (Hz)
+      - bulge metrics from find_peaks props
+      - phase-anchored sine fit params around this peak (vNMSE + window)
+      - optional local orientation over the fit window
+    """
+    rows: List[dict] = []
+    features_cfg = features_cfg or {}
+
+    p = np.asarray(peaks_idx, dtype=int)
+    if p.size == 0:
+        return rows
+
+    sample_id = sample_id_from_name(sample)
+    maybe_track_id = coerce_track_id(track_stem)
+
+    # Global fallback frames/period if needed
+    global_fpp = (sampling_rate / float(global_freq_hz)) if (sampling_rate and global_freq_hz and global_freq_hz > 0) else None
+
+    for idx_in_list, peak_i in enumerate(p):
+        frame = float(x[peak_i])
+        pos = float(y[peak_i])
+        amp = float(residual[peak_i])
+
+        # Local period estimate from neighbor gaps; fallback to global
+        local_fpp = _local_period_frames_from_peaks(p, idx_in_list)
+        frames_per_period = local_fpp if (local_fpp and local_fpp > 0) else (global_fpp if (global_fpp and global_fpp > 0) else np.nan)
+        period_frames = float(frames_per_period) if np.isfinite(frames_per_period) else np.nan
+        period_s = (period_frames / sampling_rate) if (sampling_rate and np.isfinite(period_frames)) else np.nan
+        freq_hz = (1.0 / period_s) if (np.isfinite(period_s) and period_s > 0) else (float(global_freq_hz) if (global_freq_hz and global_freq_hz > 0) else np.nan)
+
+        # Bulge metrics
+        bulge = bulge_from_props(peak_i, p, peak_props or {}, sampling_rate)
+
+        # Anchored sine fit (phase maximum at this peak)
+        fit = anchored_sine_params(
+            residual=residual,
+            x=x,
+            sampling_rate=sampling_rate,
+            freq=freq_hz if (freq_hz and freq_hz > 0) else (global_freq_hz or np.nan),
+            center_idx=int(peak_i),
+            period_frac=float(features_cfg.get("fit_window_period_frac", period_frac_for_fit)),
+        )
+
+        # Local orientation over the fit window if available
+        lo = fit.get("fit_window_lo", np.nan)
+        hi = fit.get("fit_window_hi", np.nan)
+        if np.isfinite(lo) and np.isfinite(hi):
+            i0, i1 = int(max(0, lo)), int(min(len(x) - 1, hi))
+            ang_mean, ang_std = orientation_deg(x[i0:i1 + 1], y[i0:i1 + 1])
+        else:
+            ang_mean, ang_std = (np.nan, np.nan)
+
+        rows.append({
+            # IDs
+            "Sample": sample,
+            "sample_id": int(sample_id),
+            "Track": maybe_track_id if maybe_track_id is not None else track_stem,
+            "track_id": int(maybe_track_id) if maybe_track_id is not None else np.nan,
+            "Peak index": idx_in_list + 1,            # 1-based within the track
+            "Peak frame": frame,
+            "Peak position (px)": pos,
+            "Amplitude (pixels)": amp,
+
+            # Local period/freq
+            "Local period (frames)": period_frames,
+            "Local period (s)": period_s,
+            "Local frequency (Hz)": freq_hz,
+
+            # Bulge metrics (from scipy props)
+            "bulge_prominence_px": bulge.get("bulge_prominence_px", np.nan),
+            "bulge_width_frames": bulge.get("bulge_width_frames", np.nan),
+            "bulge_width_s": bulge.get("bulge_width_s", np.nan),
+
+            # Anchored fit params & quality
+            "fit_amp_A": fit.get("fit_amp_A", np.nan),
+            "fit_phase_phi": fit.get("fit_phase_phi", np.nan),
+            "fit_offset_c": fit.get("fit_offset_c", np.nan),
+            "fit_freq_hz": fit.get("fit_freq_hz", np.nan),
+            "fit_error_vnmse": fit.get("fit_error_vnmse", np.nan),
+            "fit_window_lo": fit.get("fit_window_lo", np.nan),
+            "fit_window_hi": fit.get("fit_window_hi", np.nan),
+
+            # Local orientation in the fit window (diagnostic)
+            "orientation_deg": ang_mean,
+            "orientation_std_deg": ang_std,
+        })
+
+    return rows
+
 
 def build_wave_rows(
     *,
