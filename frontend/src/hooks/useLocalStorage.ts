@@ -1,33 +1,35 @@
 // frontend/src/hooks/useLocalStorage.ts
 import * as React from "react";
 
-/** JSON localStorage with SSR safety. Returns [value, setValue]. */
-export function useLocalStorage<T>(key: string, initialValue: T) {
-  const read = React.useCallback((): T => {
-    if (typeof window === "undefined") return initialValue;
+export function useLocalStorage<T>(key: string, initial: T) {
+  // lazy init from current key
+  const [value, setValue] = React.useState<T>(() => {
     try {
-      const raw = window.localStorage.getItem(key);
-      return raw != null ? (JSON.parse(raw) as T) : initialValue;
+      const raw = localStorage.getItem(key);
+      return raw != null ? (JSON.parse(raw) as T) : initial;
     } catch {
-      return initialValue;
+      return initial;
     }
-  }, [key, initialValue]);
+  });
 
-  const [state, setState] = React.useState<T>(read);
+  // Track the active key; when the key changes, load once without looping
+  const keyRef = React.useRef(key);
+  React.useEffect(() => {
+    if (keyRef.current === key) return;
+    keyRef.current = key;
+    let next = initial;
+    try {
+      const raw = localStorage.getItem(key);
+      next = raw != null ? (JSON.parse(raw) as T) : initial;
+    } catch {}
+    // Only update if different to avoid unnecessary renders
+    setValue((prev) => (Object.is(prev, next) ? prev : next));
+  }, [key, initial]);
 
-  const set = React.useCallback(
-    (val: T | ((prev: T) => T)) => {
-      setState(prev => {
-        const next = typeof val === "function" ? (val as (p: T) => T)(prev) : val;
-        try { window.localStorage.setItem(key, JSON.stringify(next)); } catch {}
-        return next;
-      });
-    },
-    [key]
-  );
+  // Persist on value/key change
+  React.useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  }, [key, value]);
 
-  // Reload from storage if key changes at runtime
-  React.useEffect(() => { setState(read()); }, [read]);
-
-  return [state, set] as const;
+  return [value, setValue] as const;
 }
