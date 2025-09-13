@@ -18,6 +18,7 @@ import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useWaveMetrics } from "@/hooks/useWaveMetrics";
 
 import { downloadJSON, downloadPNGFromCanvas, downloadCSV } from "@/utils/download";
+import type { DebugLayer } from "@/utils/api";
 
 import type { OverlayPayload, OverlayTrack as Track } from "@/utils/types";
 import type { FilterPredicate, ColorRule, SortSpec } from "@/utils/viewerTypes";
@@ -27,27 +28,39 @@ const CANVAS_DOWNLOAD_NAME = "overlay.png";
 const FILTERED_JSON_NAME = "filtered_tracks.json";
 const FILTERED_CSV_NAME = "filtered_tracks.csv";
 
-const RUN_ID_RE = /^[a-f0-9]{6,32}$/i;
-const sanitizeRunId = (v?: string | null) => (v && RUN_ID_RE.test(v) && !v.includes("/") ? v : null);
-
 export default function AdvancedViewerPage() {
   const navigate = useNavigate();
   const apiBase = useApiBase();
 
+  // Pull everything from context so Advanced stays in lockstep with Dashboard
   const {
-    selectedRunId,
+    safeRunId,
+    verified,
     overlay,
     overlayLoading,
-    baseImageUrl,
+    baseImageUrl,    // /runs/:id/output/base.png
+    debugImageUrl,   // /runs/:id/output/<layer>.png or null
     viewerOptions,
     setViewerOptions,
     refreshOverlay,
+    artifacts,
   } = useDashboard();
 
-  const safeRunId = React.useMemo(() => sanitizeRunId(selectedRunId ?? null), [selectedRunId]);
+  // ===== DEBUG: log inputs whenever they change =====
+  React.useEffect(() => {
+    console.log("[AV] inputs", {
+      safeRunId,
+      verified,
+      baseImageUrl,
+      debugImageUrl,
+      showBase: viewerOptions.showBase,
+      debugLayer: (viewerOptions as any)?.debugLayer,
+      tracks: overlay?.tracks?.length ?? 0,
+    });
+  }, [safeRunId, verified, baseImageUrl, debugImageUrl, viewerOptions, overlay]);
 
   // ---- CSV metrics (augment each track with a `csv` object) ----
-  const { rowByTrackId } = useWaveMetrics(safeRunId);
+  const { rowByTrackId } = useWaveMetrics(safeRunId || undefined, artifacts, { allowGuesses: false });
   const allBaseTracks: Track[] = overlay?.tracks ?? [];
   const allTracksAugmented: (Track & { csv?: Record<string, any> })[] = React.useMemo(
     () =>
@@ -120,7 +133,20 @@ export default function AdvancedViewerPage() {
   const wrapperRef = React.useRef<HTMLDivElement | null>(null);
   const [cursorTip, setCursorTip] = React.useState({ visible: false, x: 0, y: 0, dataX: 0, dataY: 0 });
   const updateCursor = useRafThrottle((p: { canvasX: number; canvasY: number; dataX: number; dataY: number }) => {
-    setCursorTip({ visible: true, x: p.canvasX + 12, y: p.canvasY + 12, dataX: p.dataX, dataY: p.dataY });
+    const roundedX = Math.round(p.dataX);
+    const roundedY = Math.round(p.dataY);
+    setCursorTip((prev) => {
+      if (
+        prev.visible &&
+        Math.round(prev.dataX) === roundedX &&
+        Math.round(prev.dataY) === roundedY &&
+        Math.round(prev.x) === Math.round(p.canvasX + 12) &&
+        Math.round(prev.y) === Math.round(p.canvasY + 12)
+      ) {
+        return prev; // nothing changed; skip update
+      }
+      return { visible: true, x: p.canvasX + 12, y: p.canvasY + 12, dataX: p.dataX, dataY: p.dataY };
+    });
   });
   const clearCursor = React.useCallback(() => setCursorTip((c) => ({ ...c, visible: false })), []);
 
@@ -150,27 +176,41 @@ export default function AdvancedViewerPage() {
 
   const hasOverlay = (overlay?.tracks?.length ?? 0) > 0;
 
+  // Remember last non-"none" debug layer for the toggle UX
+  const lastDebugLayerRef = React.useRef<DebugLayer>("prob");
+  React.useEffect(() => {
+    const dl = (viewerOptions as any)?.debugLayer as DebugLayer | "none" | undefined;
+    if (dl && dl !== "none") lastDebugLayerRef.current = dl;
+  }, [viewerOptions]);
+
   // ================== SSE for overlay updates ==================
-  const [sseEnabled, setSseEnabled] = React.useState(true);
+  const [sseEnabled, setSseEnabled] = React.useState(false);
+
+  // Always do one forced fetch as soon as we know the run id
+  React.useEffect(() => {
+    if (!safeRunId) return;
+    void refreshOverlay({ force: true });
+  }, [safeRunId, refreshOverlay]);
+
+  // Only start SSE after the run has been verified to exist
+  React.useEffect(() => { setSseEnabled(!!verified); }, [verified]);
+
   const sseUrl = React.useMemo(
     () => (sseEnabled && safeRunId ? `${apiBase}/api/runs/${encodeURIComponent(safeRunId)}/events?replay=1` : null),
-    [apiBase, safeRunId, sseEnabled]
+    [apiBase, sseEnabled, safeRunId]
   );
 
   useSSE<BackendEvent>({
     url: sseUrl,
-    autoReconnect: true,
+    autoReconnect: false, // avoid looping on 404 for stale/missing runs
     onStatus: (st) => { if (/^(DONE|ERROR|CANCELLED)$/i.test(st)) setSseEnabled(false); },
     onDirty: async (flags) => { if (flags.overlay) await refreshOverlay(); },
     coalesceWindowMs: 80,
   });
-
-  React.useEffect(() => {
-    if (!safeRunId) return;
-    setSseEnabled(true);
-    void refreshOverlay();
-  }, [safeRunId, refreshOverlay]);
   // =============================================================
+
+  const filtersHideAll =
+    hasOverlay && filteredTracks.length === 0 && (filters.length > 0 || sort.length > 0);
 
   return (
     <div className="min-h-[calc(100vh-56px)] p-4">
@@ -178,11 +218,52 @@ export default function AdvancedViewerPage() {
       <div className="mb-3 flex items-center justify-between">
         <div className="min-w-0">
           <h1 className="text-slate-100 font-semibold text-lg">Advanced Viewer</h1>
-          <div className="text-xs text-slate-400 mt-1">
-            {overlayLoading ? "Refreshing overlay…" : hasOverlay ? `${overlay?.tracks.length.toLocaleString()} tracks` : "No overlay loaded"}
+
+          <div className="text-xs text-slate-400 mt-1 flex items-center flex-wrap">
+            {/* status / counts */}
+            {overlayLoading
+              ? "Refreshing overlay…"
+              : (overlay?.tracks?.length ?? 0) > 0
+              ? `${overlay!.tracks.length.toLocaleString()} tracks`
+              : "No overlay loaded"}
+
+            {/* Base/debug links come from context; valid even if no tracks */}
+            {viewerOptions.showBase && baseImageUrl && (
+              <span className="ml-2">
+                base:{" "}
+                <a
+                  href={baseImageUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline decoration-slate-600 hover:text-slate-300"
+                >
+                  base.png
+                </a>
+              </span>
+            )}
+
+            {(viewerOptions as any)?.debugLayer !== "none" && !!debugImageUrl && (
+              <span className="ml-2">
+                debug:{" "}
+                <a
+                  href={debugImageUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline decoration-slate-600 hover:text-slate-300"
+                >
+                  {(viewerOptions as any).debugLayer}.png
+                </a>
+              </span>
+            )}
+          </div>
+
+          {/* ===== DEBUG: show raw state for quick visual confirmation ===== */}
+          <div className="text-[11px] text-slate-500 mt-1">
+            run: <span className="font-mono">{safeRunId || "—"}</span> · verified: {String(verified)}
           </div>
         </div>
 
+        {/* Controls */}
         <div className="flex items-center gap-2">
           <label className="inline-flex items-center gap-2 text-sm text-slate-300">
             <input
@@ -192,6 +273,42 @@ export default function AdvancedViewerPage() {
             />
             Show base
           </label>
+
+          {/* Debug layer toggle + selector */}
+          <label className="inline-flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={(viewerOptions as any)?.debugLayer && (viewerOptions as any).debugLayer !== "none"}
+              onChange={(e) => {
+                const on = e.target.checked;
+                if (on) {
+                  setViewerOptions({ debugLayer: lastDebugLayerRef.current } as any);
+                } else {
+                  const dl = (viewerOptions as any)?.debugLayer as DebugLayer | "none" | undefined;
+                  if (dl && dl !== "none") lastDebugLayerRef.current = dl;
+                  setViewerOptions({ debugLayer: "none" } as any);
+                }
+              }}
+            />
+            Debug
+          </label>
+          <select
+            className="bg-slate-900/60 text-slate-200 px-2 py-1 rounded border border-slate-600 text-sm"
+            value={(viewerOptions as any)?.debugLayer ?? "none"}
+            onChange={(e) => {
+              const dl = e.target.value as DebugLayer | "none";
+              setViewerOptions({ debugLayer: dl } as any);
+              if (dl !== "none") lastDebugLayerRef.current = dl as DebugLayer;
+            }}
+          >
+            <option value="none">none</option>
+            <option value="prob">prob</option>
+            <option value="mask_raw">mask_raw</option>
+            <option value="mask_clean">mask_clean</option>
+            <option value="mask_filtered">mask_filtered</option>
+            <option value="skeleton">skeleton</option>
+            <option value="mask_hysteresis">mask_hysteresis</option>
+          </select>
 
           <div className="inline-flex items-center gap-1 text-sm">
             <span className="text-slate-300">Time</span>
@@ -229,7 +346,7 @@ export default function AdvancedViewerPage() {
 
           <button
             className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800"
-            onClick={() => void refreshOverlay()}
+            onClick={() => void refreshOverlay({ force: true })}
             disabled={overlayLoading}
           >
             {overlayLoading ? "Refreshing…" : "Refresh"}
@@ -251,10 +368,13 @@ export default function AdvancedViewerPage() {
           <div className="rounded-xl border border-slate-700/50 bg-console-700 p-3">
             <OverlayCanvas
               payload={filteredPayload as OverlayPayload}
-              baseImageUrl={viewerOptions.showBase ? baseImageUrl ?? undefined : undefined}
+              // Pass URLs unconditionally; OverlayCanvas decides via options whether to draw them
+              baseImageUrl={baseImageUrl ?? undefined}
+              debugImageUrl={debugImageUrl ?? undefined}
               options={viewerOptions}
               padding={20}
-              style={{ height: "min(75vh, 760px)" }}
+              // ===== DEBUG: force visible size and outline so you can see the canvas box =====
+              style={{ height: "min(75vh, 760px)", minHeight: 320, outline: "2px dashed #ff4d4f" }}
               className="block"
               onPointerMove={showCursorCoords ? updateCursor : undefined}
               onPointerLeave={showCursorCoords ? clearCursor : undefined}
@@ -311,12 +431,9 @@ export default function AdvancedViewerPage() {
 
         {/* Right panel */}
         <CollapsiblePane title="Controls & Stats" storageKey={PANEL_STORAGE_KEY} defaultWidth={600} minWidth={340} maxWidth={900}>
-          {/* Outer wrapper enables horizontal scroll if the pane is narrower than our rows */}
           <div className="overflow-x-auto pr-2">
-            {/* Inner wrapper establishes a minimum content width so rows never get clipped */}
             <div className="min-w-[520px]">
               <AdvancedSidePanel
-                // Pass augmented tracks so the field catalog includes CSV fields
                 tracks={allTracksAugmented as any}
                 onDownloadPNG={handleDownloadPNG}
                 onDownloadJSON={handleDownloadJSON}
