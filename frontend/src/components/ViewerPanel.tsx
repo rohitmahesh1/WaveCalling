@@ -1,12 +1,16 @@
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
+import { useApiBase } from "@/context/ApiContext";
 import type { OverlayPayload } from "@/utils/types";
 import ViewerToolbar, { ViewerOptions } from "@/components/ViewerToolbar";
 import OverlayCanvas from "@/components/OverlayCanvas";
+import { buildDebugImageUrl } from "@/utils/api";
 
 interface Props {
   overlay: OverlayPayload | null;
   baseImageUrl?: string | null;
+  /** Optional explicit URL for the selected debug layer image. If omitted, we derive it. */
+  debugImageUrl?: string | null;
   summary?: { tracks: number; points: number } | null;
   options: ViewerOptions;
   onOptionsChange: (partial: Partial<ViewerOptions>) => void;
@@ -40,6 +44,7 @@ function EmptyOverlay({
 export default function ViewerPanel({
   overlay,
   baseImageUrl,
+  debugImageUrl, // optional override
   summary,
   options,
   onOptionsChange,
@@ -47,7 +52,27 @@ export default function ViewerPanel({
   onRefresh,
 }: Props) {
   const navigate = useNavigate();
-  const hasOverlay = !!overlay && (overlay.tracks?.length || 0) > 0;
+  const apiBase = useApiBase();
+
+  const hasOverlay = !!overlay && (overlay as any)?.tracks && ((overlay as any).tracks.length || 0) > 0;
+
+  // If a debug image URL is explicitly passed, prefer it.
+  // Otherwise, build it from apiBase + run_id + selected layer.
+  const derivedDebugUrl = React.useMemo(() => {
+    if (debugImageUrl) return debugImageUrl || undefined;
+    const layer = (options as any)?.debugLayer as
+      | "none"
+      | "prob"
+      | "mask_raw"
+      | "mask_clean"
+      | "mask_filtered"
+      | "skeleton"
+      | "mask_hysteresis"
+      | undefined;
+    const runId = (overlay as any)?.run_id as string | undefined;
+    if (!apiBase || !runId || !layer || layer === "none") return undefined;
+    return buildDebugImageUrl(apiBase, runId, layer);
+  }, [apiBase, overlay, options, debugImageUrl]);
 
   const statusNode = (() => {
     if (loading && !hasOverlay) return <span className="italic">Loading overlay…</span>;
@@ -78,7 +103,6 @@ export default function ViewerPanel({
           onChange={onOptionsChange}
           onRefresh={onRefresh}
           loading={loading}
-          // NEW: expose “Advanced” navigation if route exists
           onOpenAdvanced={() => navigate("/viewer/advanced")}
           advancedLabel="Advanced"
         />
@@ -99,17 +123,32 @@ export default function ViewerPanel({
             </a>
           </span>
         )}
+        {((options as any)?.debugLayer !== "none") && derivedDebugUrl && (
+          <span className="ml-3">
+            debug:{" "}
+            <a
+              href={derivedDebugUrl}
+              className="underline decoration-slate-600 hover:text-slate-300"
+              target="_blank"
+              rel="noreferrer"
+            >
+              {(options as any)?.debugLayer}.png
+            </a>
+          </span>
+        )}
       </div>
 
       {hasOverlay ? (
         <OverlayCanvas
-          payload={overlay}
+          payload={overlay as any}
           baseImageUrl={options.showBase ? baseImageUrl ?? undefined : undefined}
+          // If your OverlayCanvas supports rendering the debug image beneath the tracks,
+          // pass it here. If not, just remove the prop below.
+          debugImageUrl={derivedDebugUrl}
           options={options}
           padding={20}
           style={{ height: "min(70vh, 720px)" }}
           className="mt-3"
-          // advanced props are optional; basic panel leaves them out
         />
       ) : (
         <EmptyOverlay loading={loading} onRefresh={onRefresh} />
