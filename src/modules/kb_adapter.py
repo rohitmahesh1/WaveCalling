@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import shutil
 from typing import Union, List, Tuple, Optional, Dict
 
 import numpy as np
@@ -492,6 +493,43 @@ def _save_npy_tracks(tracks: List[Track], out_dir: Path, min_length: int) -> int
         saved += 1
     return saved
 
+def _find_run_dir_from(path: Path) -> Path | None:
+    """Walk up until we find the run root (has run.json)."""
+    p = Path(path).resolve()
+    for anc in [p] + list(p.parents):
+        if (anc / "run.json").exists():
+            return anc
+    return None
+
+def _publish_debug_to_runs(heatmap_path: Path, base_dir: Path) -> Path | None:
+    """
+    Copy <base_dir>/debug/*.png to runs/<run_id>/output/<layer>.png
+    Returns the destination directory if anything got copied.
+    """
+    src_debug = base_dir / "debug"
+    if not src_debug.exists():
+        return None
+
+    run_dir = _find_run_dir_from(heatmap_path)
+    if run_dir is None:
+        return None
+
+    dest = run_dir / "output"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    copied = False
+    for name in ("prob", "mask_raw", "mask_clean", "mask_filtered", "skeleton", "mask_hysteresis"):
+        src = src_debug / f"{name}.png"
+        if src.exists():
+            shutil.copy2(src, dest / f"{name}.png")
+            copied = True
+
+    # optional: keep stats for quick inspection
+    stats = src_debug / "stats.txt"
+    if stats.exists():
+        shutil.copy2(stats, dest / "debug_stats.txt")
+
+    return dest if copied else None
 
 # ---------------------------
 # Main ONNX-backed runner
@@ -720,7 +758,6 @@ def run_kymobutler(
         cv2.imwrite(str(dbg / "skeleton.png"), (skel * 255))
         if hmask is not None:
             cv2.imwrite(str(dbg / "mask_hysteresis.png"), (hmask.astype(np.uint8) * 255))
-        # quick stats
         with open(dbg / "stats.txt", "w") as f:
             pct_raw = float(mask0.mean()) * 100.0
             pct_clean = float(mask.mean()) * 100.0
@@ -729,6 +766,9 @@ def run_kymobutler(
             f.write(f"thr_used={used_thr:.6f}\n")
             f.write(f"mask_raw_pct={pct_raw:.2f} mask_clean_pct={pct_clean:.2f} mask_filtered_pct={pct_filt:.2f}\n")
             f.write(f"skel_px_base={BASE_PX} skel_px_final={int(skel.sum())} keep_floor={MIN_KEEP_PX}\n")
+
+        # NEW: mirror debug images into runs/<run_id>/output/overlay/debug/<image_id>/
+        _publish_debug_to_runs(heatmap_path, base_dir)
 
     # tracking on seg-sized, WL-preprocessed gray aligned to prob shape
     gray_seg = kb.preproc_for_seg(gray_orig, hw=prob.shape)  # ensure your KymoButlerPT supports hw=(H,W)
