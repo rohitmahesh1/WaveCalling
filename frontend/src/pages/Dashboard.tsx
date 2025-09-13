@@ -13,10 +13,8 @@ import ProgressBar from "@/components/ProgressBar";
 import RunStatusBadge from "@/components/RunStatusBadge";
 import EmptyState from "@/components/EmptyState";
 
-import ConfigEditorPanel from "@/components/config/ConfigEditorPanel";
-
 import type { JobEvent } from "@/utils/types";
-import { cancelRun, resumeRun } from "@/utils/api";
+import { cancelRun, resumeRun, buildDebugImageUrl, type DebugLayer } from "@/utils/api";
 
 /**
  * Configure phases here (logging only; refreshes are SSE-driven now).
@@ -84,17 +82,28 @@ function DashboardInner() {
   } = useDashboard();
 
   const safeRunId = React.useMemo(() => sanitizeRunId(selectedRunId), [selectedRunId]);
-  const [overridesJson, setOverridesJson] = React.useState<string>("");
+  const verified = React.useMemo(
+    () => !!selectedInfo && selectedInfo.run_id === safeRunId,
+    [selectedInfo, safeRunId]
+  );
 
-  // Toggle SSE on/off to prevent reconnect after terminal
-  const [sseEnabled, setSseEnabled] = React.useState(true);
+  // Build the debug-layer image URL (if a layer is selected)
+  const debugImageUrl = React.useMemo(() => {
+    if (!apiBase || !safeRunId) return undefined;
+    const layer = (viewerOptions as any)?.debugLayer as DebugLayer | "none" | undefined;
+    if (!layer || layer === "none") return undefined;
+    return buildDebugImageUrl(apiBase, safeRunId, layer);
+  }, [apiBase, safeRunId, (viewerOptions as any)?.debugLayer]);
+
+  // Toggle SSE on/off to prevent reconnect after terminal or when unverified
+  const [sseEnabled, setSseEnabled] = React.useState(false);
 
   const sseUrl = React.useMemo(
     () =>
-      sseEnabled && safeRunId
-        ? `${apiBase}/api/runs/${encodeURIComponent(safeRunId)}/events?replay=10`
+      sseEnabled && verified
+        ? `${apiBase}/api/runs/${encodeURIComponent(safeRunId!)}/events?replay=10`
         : null,
-    [apiBase, safeRunId, sseEnabled]
+    [apiBase, sseEnabled, verified, safeRunId]
   );
 
   // --- Paused state: persisted per run, with smart default ---
@@ -133,8 +142,7 @@ function DashboardInner() {
   // SSE: event-driven refresh wiring (coalesce bursts)
   const { status: sseStatus, last, reconnect, close } = useSSE<BackendEvent>({
     url: sseUrl,
-    autoReconnect: true,
-    // widen the coalescing window so we *batch* many events into one onDirty
+    autoReconnect: false, // avoid looping on 404 for stale/missing runs
     coalesceWindowMs: 800,
     onStatus: (st) => {
       // auto-stop UI reconnects when terminal
@@ -143,17 +151,23 @@ function DashboardInner() {
     onDirty: async (flags) => {
       if (flags.overlay) refreshOverlayThrottled();
       if (flags.progress) refreshProgressThrottled();
-      // if (flags.snapshot) -> attach a throttled snapshot refresher where you use it
     },
   });
 
-  // When run changes: enable SSE and do one initial fetch (in case we mounted mid-run)
   React.useEffect(() => {
-    if (!safeRunId) return;
-    setSseEnabled(true);
-    void refreshProgress();
-    void refreshOverlay();
-  }, [safeRunId, refreshProgress, refreshOverlay]);
+    if (sseStatus === "error") setSseEnabled(false);
+  }, [sseStatus]);
+
+  // When run or verification changes: (re)enable SSE and do one initial fetch
+  React.useEffect(() => {
+    if (safeRunId && verified) {
+      setSseEnabled(true);
+      void refreshProgress();
+      void refreshOverlay();
+    } else {
+      setSseEnabled(false);
+    }
+  }, [safeRunId, verified, refreshProgress, refreshOverlay]);
 
   // --- Logging (no longer triggers refresh; SSE dirty flags handle that) ---
   const lastLogRef = React.useRef<string>("");
@@ -303,11 +317,13 @@ function DashboardInner() {
                   onOptionsChange={setViewerOptions}
                   loading={overlayLoading}
                   onRefresh={() => void refreshOverlay({ force: true })}
+                  // NEW: pass the debug-layer image URL down to ViewerPanel -> OverlayCanvas
+                  debugImageUrl={debugImageUrl}
                 />
               </div>
 
               <div className="flex flex-col gap-4">
-                <ArtifactsPanel artifacts={artifacts} />
+                <ArtifactsPanel artifactUrls={artifacts} />
                 <LiveLogPanel
                   logs={logs}
                   paused={logPaused}
