@@ -6,44 +6,39 @@ import type { ViewerOptions } from "@/components/ViewerToolbar";
 export type OverlayCanvasProps = {
   payload: OverlayPayload | null;
   baseImageUrl?: string | null;
+  /** Optional debug layer image URL (e.g., /runs/:id/output/prob.png). */
+  debugImageUrl?: string | null;
   options: ViewerOptions;
-  /** Optional padding around drawing area in CSS pixels. */
+
   padding?: number;
-  /** Extra className for the canvas element. */
   className?: string;
-  /** Inline style for the canvas wrapper. */
   style?: React.CSSProperties;
 
   onPointerMove?: (p: { canvasX: number; canvasY: number; dataX: number; dataY: number }) => void;
   onPointerLeave?: () => void;
   onClickTrack?: (track: Track | null) => void;
 
-  /** Explicit highlight (e.g., selected). */
   highlightTrackId?: string | number;
 
-  /** Return true to keep the track; if omitted, draw all tracks. */
   filterFn?: (t: Track) => boolean;
-  /** If returns a CSS color string, overrides the normal color for that track. */
   colorOverrideFn?: (t: Track) => string | undefined;
-  /** Called once the canvas element is ready (and on re-mount). */
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
 
-  /** Keep physical aspect ratio of the data/image (letterbox if needed). */
   preserveAspect?: boolean;
 
-  /** === NEW: hover UX === */
+  /** === Hover UX === */
   hoverHighlight?: boolean;
-  /** Optionally control the hovered id externally. */
   hoveredTrackId?: string | number;
-  /** Receive hover changes (null when leaving). */
   onHoverTrack?: (track: Track | null) => void;
-  /** Hit-test tolerance in CSS px (default 8). */
   hoverThresholdPx?: number;
 
-  /** === NEW: redraw keys so changes to rules force a draw, even if functions are stable === */
+  /** Redraw keys so changes to rules force a draw, even if function identities are stable. */
   filterKey?: string;
   colorKey?: string;
   sortKey?: string;
+
+  /** Show small "base/debug" link badges inside the canvas wrapper (off by default). */
+  showSourceBadges?: boolean;
 };
 
 type Viewport = {
@@ -51,21 +46,21 @@ type Viewport = {
   scaleX: number; scaleY: number; invertY: boolean;
   padding: number;
   cssW: number; cssH: number;
-  /** Offsets to center the content when aspect is preserved. */
   offsetX: number; offsetY: number;
 };
 
-type HitSample = { x: number; y: number }; // canvas-space
+type HitSample = { x: number; y: number };
 type HitEntry = {
   id: string | number;
-  bbox: { minX: number; minY: number; maxX: number; maxY: number }; // canvas-space bbox
-  samples: HitSample[]; // downsampled points in canvas space
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
+  samples: HitSample[];
   track: Track;
 };
 
 const OverlayCanvas = React.memo(function OverlayCanvasInner({
   payload,
   baseImageUrl,
+  debugImageUrl,
   options,
   padding = 20,
   className,
@@ -89,34 +84,62 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
   filterKey,
   colorKey,
   sortKey,
+
+  showSourceBadges = false,
 }: OverlayCanvasProps) {
   const wrapperRef = React.useRef<HTMLDivElement | null>(null);
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
   const [img, setImg] = React.useState<HTMLImageElement | null>(null);
+  const [debugImg, setDebugImg] = React.useState<HTMLImageElement | null>(null);
 
-  // Let parent capture the <canvas> for downloads
+  // IMPORTANT: treat debugLayer as optional to avoid type mismatches.
+  const viewerDebugLayer = (options as any)?.debugLayer as (string | undefined);
+
+  // Let parent capture the <canvas> (for downloads, etc.)
   React.useEffect(() => {
     onCanvasReady?.(canvasRef.current);
     return () => onCanvasReady?.(null);
   }, [onCanvasReady]);
 
-  // Load (or clear) base image when toggled / URL changes
+  // base image effect
   React.useEffect(() => {
     let cancelled = false;
     if (!options.showBase || !baseImageUrl) {
+      console.log("[Canvas] skip base", { showBase: options.showBase, baseImageUrl });
       setImg(null);
       return () => { cancelled = true; };
     }
+    console.log("[Canvas] load base", baseImageUrl);
     const im = new Image();
-    im.crossOrigin = "anonymous";
-    // cache-bust keeps PNG in sync; OK to keep until you switch to ETag drawing
     const u = new URL(baseImageUrl, window.location.origin);
+    if (u.origin !== window.location.origin) im.crossOrigin = "anonymous";
     u.searchParams.set("t", Date.now().toString());
-    im.onload = () => { if (!cancelled) setImg(im); };
-    im.onerror = () => { if (!cancelled) setImg(null); };
+    im.onload = () => { if (!cancelled) { console.log("[Canvas] base onload"); setImg(im); } };
+    im.onerror = () => { if (!cancelled) { console.warn("[Canvas] base onerror", u.toString()); setImg(null); } };
+    im.decoding = "async";
     im.src = u.toString();
     return () => { cancelled = true; };
   }, [options.showBase, baseImageUrl]);
+
+  // debug image effect
+  React.useEffect(() => {
+    let cancelled = false;
+    if (!debugImageUrl || !viewerDebugLayer || viewerDebugLayer === "none") {
+      console.log("[Canvas] skip debug", { debugImageUrl, viewerDebugLayer });
+      setDebugImg(null);
+      return () => { cancelled = true; };
+    }
+    console.log("[Canvas] load debug", debugImageUrl);
+    const im = new Image();
+    const u = new URL(debugImageUrl, window.location.origin);
+    if (u.origin !== window.location.origin) im.crossOrigin = "anonymous";
+    u.searchParams.set("t", Date.now().toString());
+    im.onload = () => { if (!cancelled) { console.log("[Canvas] debug onload"); setDebugImg(im); } };
+    im.onerror = () => { if (!cancelled) { console.warn("[Canvas] debug onerror", u.toString()); setDebugImg(null); } };
+    im.decoding = "async";
+    im.src = u.toString();
+    return () => { cancelled = true; };
+  }, [debugImageUrl, viewerDebugLayer]);
 
   // Current viewport mapping (for conversions + hit cache)
   const viewportRef = React.useRef<Viewport | null>(null);
@@ -127,7 +150,7 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
   // Local hovered id (uncontrolled mode)
   const [hoverLocal, setHoverLocal] = React.useState<string | number | null>(null);
   const effectiveHoverId =
-    hoveredTrackId != null ? hoveredTrackId : hoverHighlight ? hoverLocal : null;
+    hoveredTrackId != null ? hoveredTrackId : (hoverHighlight ? hoverLocal : null);
 
   // rAF throttle for hover hit-testing
   const hoverRAF = React.useRef<number | null>(null);
@@ -143,33 +166,26 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
 
   const rebuildHitCache = React.useCallback(
     (tracks: Track[], v: Viewport) => {
-      // Build downsampled points + bbox in canvas space for each visible track
       const entries: HitEntry[] = [];
       for (const t of tracks) {
         const pts = t.poly || [];
         if (pts.length < 2) continue;
 
-        // Choose a step so we cap samples roughly ~500 per long track
+        // downsample so hover is cheap
         const step = Math.max(1, Math.floor(pts.length / 500));
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         const samples: HitSample[] = new Array(Math.ceil(pts.length / step));
-
         let si = 0;
+
         for (let i = 0; i < pts.length; i += step) {
           const { cx, cy } = toCanvas(v, pts[i][1], pts[i][0]);
           samples[si++] = { x: cx, y: cy };
           if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
           if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
         }
-        // Guard for degenerate
         if (!Number.isFinite(minX + minY + maxX + maxY)) continue;
 
-        entries.push({
-          id: t.id!,
-          bbox: { minX, minY, maxX, maxY },
-          samples,
-          track: t,
-        });
+        entries.push({ id: t.id!, bbox: { minX, minY, maxX, maxY }, samples, track: t });
       }
       hitCacheRef.current = entries;
     },
@@ -215,7 +231,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
         ? allTracks.find((t) => String(t.id) === String(effectiveHoverId)) || null
         : null;
 
-    // merge highlights into draw list (unique)
     const drawTracks: Track[] = [...filtered];
     const pushUnique = (t: Track | null) => {
       if (!t) return;
@@ -226,17 +241,9 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     pushUnique(explicitHighlight);
     pushUnique(hoverHighlightTrack);
 
-    if (!drawTracks.length) {
-      ctx.fillStyle = "#9aa4bf";
-      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-      ctx.fillText("No tracks to render", 12, 20);
-      ctx.restore();
-      viewportRef.current = null;
-      hitCacheRef.current = null;
-      return;
-    }
+    const noTracks = drawTracks.length === 0;
 
-    // Compute bounds
+    // Compute bounds from tracks
     let minX = +Infinity, maxX = -Infinity, minY = +Infinity, maxY = -Infinity;
     for (const t of drawTracks) {
       const pts = t.poly || [];
@@ -250,18 +257,23 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
       }
     }
 
-    // If base image is present, prefer its natural bounds so overlay aligns perfectly
-    if (options.showBase && img) {
+    // Prefer image bounds when present so overlay aligns perfectly
+    if ((options.showBase && img) || debugImg) {
       minX = 0;
       minY = 0;
-      maxX = Math.max(maxX, img.naturalWidth);
-      maxY = Math.max(maxY, img.naturalHeight);
+      const w1 = img?.naturalWidth ?? 0;
+      const h1 = img?.naturalHeight ?? 0;
+      const w2 = debugImg?.naturalWidth ?? 0;
+      const h2 = debugImg?.naturalHeight ?? 0;
+      maxX = Math.max(maxX, w1, w2);
+      maxY = Math.max(maxY, h1, h2);
     }
 
-    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxY)) {
+    // If we truly have nothing (no tracks and no images), show a hint and bail.
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
       ctx.fillStyle = "#9aa4bf";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-      ctx.fillText("Invalid bounds", 12, 20);
+      ctx.fillText("No tracks to render", 12, 20);
       ctx.restore();
       viewportRef.current = null;
       hitCacheRef.current = null;
@@ -302,15 +314,13 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     };
     viewportRef.current = viewport;
 
-    // ----- Base image (optional) -----
-    if (options.showBase && img) {
-      // Current data bounds and effective content box
+    // Helper to draw any image aligned to current data bounds (handles Y origin)
+    const drawAlignedImage = (image: HTMLImageElement, alpha: number) => {
       const sx = Math.max(0, Math.floor(minX));
-      const syUp = Math.max(0, Math.floor(minY));
-      const sw = Math.max(1, Math.min(img.naturalWidth  - sx, Math.ceil(maxX - minX)));
-      const sh = Math.max(1, Math.min(img.naturalHeight - syUp, Math.ceil(maxY - minY)));
-
-      const syTL = img.naturalHeight - (syUp + sh);
+      const syDataMin = Math.max(0, Math.floor(minY));
+      const sw = Math.max(1, Math.min(image.naturalWidth  - sx, Math.ceil(maxX - minX)));
+      const sh = Math.max(1, Math.min(image.naturalHeight - syDataMin, Math.ceil(maxY - minY)));
+      const syTL = invertY ? (image.naturalHeight - (syDataMin + sh)) : syDataMin;
 
       const dx = offsetX;
       const dy = offsetY;
@@ -318,10 +328,16 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
       const dh = (maxY - minY) * scaleY;
 
       ctx.save();
-      ctx.globalAlpha = 0.6;
-      ctx.drawImage(img, sx, syTL, sw, sh, dx, dy, dw, dh);
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(image, sx, syTL, sw, sh, dx, dy, dw, dh);
       ctx.restore();
-    }
+    };
+
+    // Base image
+    if (options.showBase && img) drawAlignedImage(img, 0.6);
+
+    // Debug image
+    if (debugImg) drawAlignedImage(debugImg, 0.7);
 
     // ----- Color logic -----
     const colorForTrack = (t: Track) => {
@@ -330,13 +346,13 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
 
       if (options.colorBy === "dominant_frequency") {
         const f = Number(t.metrics?.dominant_frequency ?? 0);
-        const hue = 200 + Math.max(0, Math.min(1, f / 2)) * 140; // 0..2Hz → 200..340
+        const hue = 200 + Math.max(0, Math.min(1, f / 2)) * 140;
         return `hsl(${hue}deg 70% 70% / 0.9)`;
       }
       if (options.colorBy === "amplitude") {
         const a = Number(t.metrics?.mean_amplitude ?? 0);
-        const tval = Math.max(0, Math.min(1, a / 10)); // heuristic
-        const hue = 140 - tval * 100; // green → yellow/red
+        const tval = Math.max(0, Math.min(1, a / 10));
+        const hue = 140 - tval * 100;
         return `hsl(${hue}deg 70% 70% / 0.9)`;
       }
       return "rgba(80, 200, 120, 0.85)";
@@ -356,12 +372,8 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
 
       ctx.lineWidth = style.width;
       ctx.strokeStyle = style.stroke;
-      if (style.glow) {
-        ctx.shadowColor = style.stroke;
-        ctx.shadowBlur = 6;
-      } else {
-        ctx.shadowBlur = 0;
-      }
+      ctx.shadowColor = style.glow ? style.stroke : "transparent";
+      ctx.shadowBlur = style.glow ? 6 : 0;
 
       ctx.beginPath();
       const p0 = toCanvas(viewport, pts[0][1], pts[0][0]);
@@ -373,23 +385,12 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
       ctx.stroke();
     };
 
-    // Normal layer
     ctx.globalCompositeOperation = "source-over";
-    for (const t of normal) {
-      drawOne(t, { width: 1.2, stroke: colorForTrack(t) });
-    }
-    // Hover layer (slightly thicker)
-    for (const t of hovered) {
-      const c = colorForTrack(t);
-      drawOne(t, { width: 2.0, stroke: c, glow: true });
-    }
-    // Explicit highlight layer (top-most)
-    for (const t of highlighted) {
-      const c = colorForTrack(t);
-      drawOne(t, { width: 2.4, stroke: c, glow: true });
-    }
+    for (const t of normal) drawOne(t, { width: 1.2, stroke: colorForTrack(t) });
+    for (const t of hovered) drawOne(t, { width: 2.0, stroke: colorForTrack(t), glow: true });
+    for (const t of highlighted) drawOne(t, { width: 2.4, stroke: colorForTrack(t), glow: true });
 
-    // ----- Peaks -----
+    // Peaks
     ctx.fillStyle = "rgba(255, 120, 120, 0.9)";
     for (const t of drawTracks) {
       if (!t.peaks || !t.poly) continue;
@@ -409,16 +410,24 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     ctx.lineWidth = 1;
     ctx.strokeRect(0.5, 0.5, cssW - 1, cssH - 1);
 
+    // Hint when truly empty
+    if (noTracks && !(options.showBase && img) && !debugImg) {
+      ctx.fillStyle = "#9aa4bf";
+      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+      ctx.fillText("No tracks to render", 12, 20);
+    }
+
     ctx.restore();
 
-    // Build hit cache for hover from what we just drew
     rebuildHitCache(drawTracks, viewport);
   }, [
     payload,
     img,
+    debugImg,
     options.showBase,
     options.timeDirection,
     options.colorBy,
+    viewerDebugLayer,       // <- react to debug layer changes safely
     padding,
     filterFn,
     colorOverrideFn,
@@ -427,7 +436,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     toCanvas,
     rebuildHitCache,
     effectiveHoverId,
-    // NEW: when rules change, force a redraw even if filterFn/colorOverrideFn are stable
     filterKey,
     colorKey,
     sortKey,
@@ -443,15 +451,11 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     return () => ro.disconnect();
   }, [draw]);
 
-  // Redraw on payload/base image changes
-  React.useEffect(() => {
-    draw();
-  }, [payload, img, draw]);
+  // Redraw on payload/base/debug image changes
+  React.useEffect(() => { draw(); }, [payload, img, debugImg, draw]);
 
   // If external hover id changes, redraw to reflect it
-  React.useEffect(() => {
-    if (hoveredTrackId != null) draw();
-  }, [hoveredTrackId, draw]);
+  React.useEffect(() => { if (hoveredTrackId != null) draw(); }, [hoveredTrackId, draw]);
 
   // ----- Pointer interactions -----
   const toDataCoords = React.useCallback((canvasX: number, canvasY: number) => {
@@ -474,7 +478,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
 
     const thresh2 = hoverThresholdPx * hoverThresholdPx;
 
-    // Quick pass: bbox rejection
     let best: { entry: HitEntry; d2: number } | null = null;
     for (const e of cache) {
       if (
@@ -482,50 +485,29 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
         pt.cx > e.bbox.maxX + hoverThresholdPx ||
         pt.cy < e.bbox.minY - hoverThresholdPx ||
         pt.cy > e.bbox.maxY + hoverThresholdPx
-      ) {
-        continue;
-      }
-      // Coarse nearest on samples
+      ) continue;
+
       for (let i = 0; i < e.samples.length; i++) {
         const dx = e.samples[i].x - pt.cx;
         const dy = e.samples[i].y - pt.cy;
         const d2 = dx * dx + dy * dy;
-        if (!best || d2 < best.d2) {
-          best = { entry: e, d2 };
-        }
+        if (!best || d2 < best.d2) best = { entry: e, d2 };
       }
     }
 
-    const newHover =
-      best && best.d2 <= thresh2 ? String(best.entry.id) : null;
+    const newHover = best && best.d2 <= thresh2 ? String(best.entry.id) : null;
     const prevHover = hoverLocal != null ? String(hoverLocal) : null;
 
     if (newHover !== prevHover) {
-      // Update local state only if uncontrolled
-      if (hoveredTrackId == null && hoverHighlight) {
-        setHoverLocal(newHover);
-      }
-      // Notify parent
-      if (onHoverTrack) {
-        onHoverTrack(
-          newHover
-            ? (cache.find((e) => String(e.id) === newHover)?.track ?? null)
-            : null
-        );
-      }
-      // Redraw to show hover layer + cursor
+      if (hoveredTrackId == null && hoverHighlight) setHoverLocal(newHover);
+      onHoverTrack?.(
+        newHover ? (cache.find((e) => String(e.id) === newHover)?.track ?? null) : null
+      );
       draw();
       const el = canvasRef.current;
       if (el) el.style.cursor = newHover ? "pointer" : "default";
     }
-  }, [
-    hoverThresholdPx,
-    hoveredTrackId,
-    hoverHighlight,
-    onHoverTrack,
-    hoverLocal,
-    draw,
-  ]);
+  }, [hoverThresholdPx, hoveredTrackId, hoverHighlight, onHoverTrack, hoverLocal, draw]);
 
   const scheduleHoverHitTest = React.useCallback(() => {
     if (hoverRAF.current != null) return;
@@ -558,7 +540,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
 
   const handlePointerLeave = React.useCallback(() => {
     onPointerLeave?.();
-    // Clear hover when leaving (uncontrolled mode)
     if (hoveredTrackId == null && hoverHighlight) {
       if (hoverLocal != null) {
         setHoverLocal(null);
@@ -569,15 +550,11 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
     if (el) el.style.cursor = "default";
   }, [onPointerLeave, hoveredTrackId, hoverHighlight, hoverLocal, draw]);
 
-  // Simple click hit-test: choose nearest cached sample (cheap & good UX)
   const handleClick = React.useCallback(
     (ev: React.MouseEvent<HTMLCanvasElement>) => {
       if (!onClickTrack) return;
       const cache = hitCacheRef.current;
-      if (!cache) {
-        onClickTrack(null);
-        return;
-      }
+      if (!cache) { onClickTrack(null); return; }
 
       const rect = (ev.currentTarget as HTMLCanvasElement).getBoundingClientRect();
       const cx = ev.clientX - rect.left;
@@ -602,14 +579,16 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
         }
       }
 
-      if (best && best.d2 <= thresh2) onClickTrack(best.entry.track);
-      else onClickTrack(null);
+      onClickTrack(best && best.d2 <= thresh2 ? best.entry.track : null);
     },
     [onClickTrack, hoverThresholdPx]
   );
 
+  const showBaseBadge = Boolean(showSourceBadges && options.showBase && baseImageUrl);
+  const showDebugBadge = Boolean(showSourceBadges && debugImageUrl && viewerDebugLayer && viewerDebugLayer !== "none");
+
   return (
-    <div ref={wrapperRef} className="w-full h-full" style={style}>
+    <div ref={wrapperRef} className="relative w-full h-full" style={style}>
       <canvas
         ref={canvasRef}
         className={`block w-full h-full ${className || ""}`}
@@ -617,6 +596,39 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
         onPointerLeave={handlePointerLeave}
         onClick={handleClick}
       />
+
+      {(showBaseBadge || showDebugBadge) && (
+        <div className="pointer-events-none absolute left-2 bottom-2 flex gap-3 text-xs text-slate-400">
+          {showBaseBadge && (
+            <span className="pointer-events-auto">
+              base:{" "}
+              <a
+                href={baseImageUrl!}
+                target="_blank"
+                rel="noreferrer"
+                className="underline decoration-slate-600 hover:text-slate-300"
+                aria-label="Open base image"
+              >
+                base.png
+              </a>
+            </span>
+          )}
+          {showDebugBadge && (
+            <span className="pointer-events-auto">
+              debug:{" "}
+              <a
+                href={debugImageUrl!}
+                target="_blank"
+                rel="noreferrer"
+                className="underline decoration-slate-600 hover:text-slate-300"
+                aria-label="Open debug layer image"
+              >
+                {String(viewerDebugLayer)}.png
+              </a>
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 });
