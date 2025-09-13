@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
+import glob
 import logging
 import math
 import os
@@ -1341,7 +1342,30 @@ def get_track_detail(
         out["slice"] = {"lo": lo, "hi": hi}
 
     return _sanitize_for_json(out)
-    
+
+@app.get("/api/runs/{run_id}/debug/{layer}")
+async def get_debug_image(run_id: str, layer: str):
+    """Serve debug layer PNGs; search a few likely locations."""
+    base = _run_dir(run_id)
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="Unknown run_id")
+
+    # 1) Preferred (published) location
+    p1 = base / "output" / f"{layer}.png"
+    if p1.exists():
+        return FileResponse(str(p1), media_type="image/png")
+
+    # 2) Fallbacks (older/native layouts)
+    for pat in [
+        base / "output" / "overlay" / "debug" / "*" / f"{layer}.png",
+        base / "input" / "generated_heatmaps" / "*" / "debug" / f"{layer}.png",
+        base / "input" / "debug" / f"{layer}.png",
+    ]:
+        matches = glob.glob(str(pat))
+        if matches:
+            return FileResponse(matches[0], media_type="image/png")
+
+    raise HTTPException(status_code=404, detail=f"Debug layer not found: {layer}")
 
 # Dev convenience: run with `python -m src.service.api`
 if __name__ == "__main__":
