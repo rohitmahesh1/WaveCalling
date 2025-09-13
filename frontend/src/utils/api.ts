@@ -232,3 +232,20 @@ export async function getOverlay(
 export function isFresh<T>(r: CondResult<T>): r is { data: T; notModified: false; etag?: string | null } {
   return !r.notModified && r.data != null;
 }
+
+/* Debug layers: keep in sync with ViewerOptions['debugLayer'] (minus "none") */
+export const DEBUG_LAYERS = [
+  "prob",
+  "mask_raw",
+  "mask_clean",
+  "mask_filtered",
+  "skeleton",
+  "mask_hysteresis",
+] as const;
+
+export type DebugLayer = typeof DEBUG_LAYERS[number];
+
+/** Build the API URL for a debug layer image (served by /api/runs/:id/debug/:layer). */
+export function buildDebugImageUrl(apiBase: string, runId: string, layer: DebugLayer): string {
+  return `${apiBase}/api/runs/${encodeURIComponent(runId)}/debug/${encodeURIComponent(layer)}`;
+}
