@@ -39,7 +39,6 @@ const ORDER = [
   "output_dir",
 ];
 
-// Extensions we’ll suggest as downloadable
 const DL_EXTS = new Set([".csv", ".json", ".ndjson", ".png", ".jpg", ".jpeg", ".txt"]);
 
 function getExt(u: string) {
@@ -87,47 +86,15 @@ export default function ArtifactsPanel({
     return entries;
   }, [artifactUrls]);
 
-  // If flags are provided, trust them (no HEAD).
-  const [headExists, setHeadExists] = React.useState<Record<string, boolean>>({});
-  React.useEffect(() => {
-    // Only HEAD when flags are not present (back-compat fallback).
-    if (artifactFlags) {
-      setHeadExists({});
-      return;
-    }
-    if (!pairs.length) {
-      setHeadExists({});
-      return;
-    }
-    const ctrl = new AbortController();
-    (async () => {
-      const res: Record<string, boolean> = {};
-      await Promise.all(
-        pairs.map(async ([k, url]) => {
-          try {
-            const r = await fetch(url, { method: "HEAD", cache: "no-cache", signal: ctrl.signal });
-            res[k] = r.ok;
-          } catch {
-            res[k] = false;
-          }
-        })
-      );
-      if (!ctrl.signal.aborted) setHeadExists(res);
-    })();
-    return () => ctrl.abort();
-  }, [pairs, artifactFlags]);
-
-  // Decide visibility: prefer flags, else HEAD results, else show nothing.
+  // Decide visibility: rely ONLY on flags (no HEAD probing to avoid 404 spam).
   const visible = React.useMemo(() => {
     if (!pairs.length) return [] as [string, string][];
-    if (artifactFlags) {
+    if (artifactFlags && Object.keys(artifactFlags).length) {
       return pairs.filter(([k]) => !!artifactFlags[k]);
     }
-    if (Object.keys(headExists).length) {
-      return pairs.filter(([k]) => !!headExists[k]);
-    }
-    return []; // conservative default
-  }, [pairs, artifactFlags, headExists]);
+    // No flags yet: show nothing to avoid probing non-existent artifacts.
+    return [];
+  }, [pairs, artifactFlags]);
 
   const copy = React.useCallback(async (k: string, v: string) => {
     try {
@@ -135,7 +102,7 @@ export default function ArtifactsPanel({
       setCopiedKey(k);
       setTimeout(() => setCopiedKey((curr) => (curr === k ? null : curr)), 1200);
     } catch {
-      // ignore
+      /* ignore */
     }
   }, []);
 
@@ -143,7 +110,9 @@ export default function ArtifactsPanel({
     <section className={`rounded-xl border border-slate-700/50 bg-console-700 p-4 ${className || ""}`}>
       <h2 className="text-slate-200 font-semibold">{title}</h2>
       {visible.length === 0 ? (
-        <div className="text-sm text-slate-400 mt-3">No artifacts available yet.</div>
+        <div className="text-sm text-slate-400 mt-3">
+          No artifacts available yet.
+        </div>
       ) : (
         <ul className="mt-3 space-y-2">
           {visible.map(([k, url]) => {
