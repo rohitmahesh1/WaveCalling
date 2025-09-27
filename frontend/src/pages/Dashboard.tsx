@@ -16,25 +16,9 @@ import EmptyState from "@/components/EmptyState";
 import type { JobEvent } from "@/utils/types";
 import { cancelRun, resumeRun, buildDebugImageUrl, type DebugLayer } from "@/utils/api";
 
-/**
- * Configure phases here (logging only; refreshes are SSE-driven now).
- */
 const EXCLUDED_PHASES = new Set<string>(["WRITE_PARTIAL", "DISCOVER"]);
-
-const RUN_ID_RE = /^[a-f0-9]{6,32}$/i;
 const pauseKey = (runId: string) => `log:paused:${runId}`;
 
-function sanitizeRunId(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  if (!s) return null;
-  if (s.startsWith("http://") || s.startsWith("https://")) return null;
-  if (s.includes("/")) return null;
-  if (!RUN_ID_RE.test(s)) return null;
-  return s;
-}
-
-// Simple leading+trailing throttle
 function useThrottle(fn: () => void, minMs: number) {
   const lastRef = React.useRef(0);
   const scheduledRef = React.useRef<number | null>(null);
@@ -60,6 +44,9 @@ function DashboardInner() {
   const {
     selectedRunId,
     setSelectedRunId,
+    safeRunId,
+    verified,
+
     selectedInfo,
     artifacts,
 
@@ -81,13 +68,6 @@ function DashboardInner() {
     setViewerOptions,
   } = useDashboard();
 
-  const safeRunId = React.useMemo(() => sanitizeRunId(selectedRunId), [selectedRunId]);
-  const verified = React.useMemo(
-    () => !!selectedInfo && selectedInfo.run_id === safeRunId,
-    [selectedInfo, safeRunId]
-  );
-
-  // Build the debug-layer image URL (if a layer is selected)
   const debugImageUrl = React.useMemo(() => {
     if (!apiBase || !safeRunId) return undefined;
     const layer = (viewerOptions as any)?.debugLayer as DebugLayer | "none" | undefined;
@@ -95,57 +75,56 @@ function DashboardInner() {
     return buildDebugImageUrl(apiBase, safeRunId, layer);
   }, [apiBase, safeRunId, (viewerOptions as any)?.debugLayer]);
 
-  // Toggle SSE on/off to prevent reconnect after terminal or when unverified
+  // Enable SSE as soon as we have a run id (no over-gating on verified)
   const [sseEnabled, setSseEnabled] = React.useState(false);
+  React.useEffect(() => { setSseEnabled(Boolean(safeRunId)); }, [safeRunId]);
 
-  const sseUrl = React.useMemo(
-    () =>
-      sseEnabled && verified
-        ? `${apiBase}/api/runs/${encodeURIComponent(safeRunId!)}/events?replay=10`
-        : null,
-    [apiBase, sseEnabled, verified, safeRunId]
-  );
+  const sseUrl = React.useMemo(() => {
+    if (!apiBase || !safeRunId || !sseEnabled) return null;
+    const u = new URL(`/api/runs/${encodeURIComponent(safeRunId)}/events`, apiBase);
+    u.searchParams.set("replay", "10");
+    u.searchParams.set("v", String(Date.now()));
+    return u.toString();
+  }, [apiBase, safeRunId, sseEnabled]);
 
-  // --- Paused state: persisted per run, with smart default ---
+  // ---- Live log pause (persisted per run) ----
   const [logPaused, _setLogPaused] = React.useState<boolean>(true);
-  const setLogPaused = React.useCallback(
-    (v: boolean) => {
-      _setLogPaused(v);
-      if (safeRunId) {
-        try {
-          window.localStorage.setItem(pauseKey(safeRunId), v ? "1" : "0");
-        } catch {}
-      }
-    },
-    [safeRunId]
-  );
+  const setLogPaused = React.useCallback((v: boolean) => {
+    _setLogPaused(v);
+    if (safeRunId) {
+      try { localStorage.setItem(pauseKey(safeRunId), v ? "1" : "0"); } catch {}
+    }
+  }, [safeRunId]);
 
   React.useEffect(() => {
     if (!safeRunId) return;
     let stored: string | null = null;
-    try {
-      stored = window.localStorage.getItem(pauseKey(safeRunId));
-    } catch {}
+    try { stored = localStorage.getItem(pauseKey(safeRunId)); } catch {}
     if (stored !== null) {
       _setLogPaused(stored === "1");
-      return;
+    } else {
+      const st = selectedInfo?.status;
+      const active = st === "RUNNING" || st === "QUEUED";
+      _setLogPaused(!active);
     }
-    const status = selectedInfo?.status;
-    const active = status === "RUNNING" || status === "QUEUED";
-    _setLogPaused(!active);
   }, [safeRunId, selectedInfo?.status]);
 
-  // Throttle the actual network work (belt & suspenders in addition to the hook's internal gating)
   const refreshOverlayThrottled = useThrottle(() => { void refreshOverlay(); }, 1200);
   const refreshProgressThrottled = useThrottle(() => { void refreshProgress(); }, 2500);
 
-  // SSE: event-driven refresh wiring (coalesce bursts)
   const { status: sseStatus, last, reconnect, close } = useSSE<BackendEvent>({
     url: sseUrl,
-    autoReconnect: false, // avoid looping on 404 for stale/missing runs
+    withCredentials: true,
+    autoReconnect: true,
     coalesceWindowMs: 800,
+    // Only auto-unpause if user didn't explicitly pause before (no stored flag)
+    onOpen: () => {
+      if (!safeRunId) return;
+      let stored: string | null = null;
+      try { stored = localStorage.getItem(pauseKey(safeRunId)); } catch {}
+      if (stored === null) setLogPaused(false);
+    },
     onStatus: (st) => {
-      // auto-stop UI reconnects when terminal
       if (/^(DONE|ERROR|CANCELLED)$/i.test(st)) setSseEnabled(false);
     },
     onDirty: async (flags) => {
@@ -158,25 +137,21 @@ function DashboardInner() {
     if (sseStatus === "error") setSseEnabled(false);
   }, [sseStatus]);
 
-  // When run or verification changes: (re)enable SSE and do one initial fetch
+  // Initial fetches
   React.useEffect(() => {
-    if (safeRunId && verified) {
-      setSseEnabled(true);
-      void refreshProgress();
-      void refreshOverlay();
-    } else {
-      setSseEnabled(false);
-    }
-  }, [safeRunId, verified, refreshProgress, refreshOverlay]);
+    if (!safeRunId) return;
+    void refreshProgress();
+    void refreshOverlay();
+  }, [safeRunId, refreshProgress, refreshOverlay]);
 
-  // --- Logging (no longer triggers refresh; SSE dirty flags handle that) ---
+  // Append SSE lines to log buffer
   const lastLogRef = React.useRef<string>("");
   const lastProcessLogAtRef = React.useRef<number>(0);
   const terminalSeenRef = React.useRef<boolean>(false);
 
   React.useEffect(() => {
     if (!last || !last.data) return;
-    const evt = last.data as unknown as JobEvent; // still compatible with our backend payload
+    const evt = last.data as unknown as JobEvent;
     const phase = evt.phase ?? "(event)";
     const isTerminal = phase === "DONE" || phase === "ERROR" || phase === "CANCELLED";
     const msgText = `[${phase}] ${evt.message ?? ""}`.trim();
@@ -188,16 +163,13 @@ function DashboardInner() {
           appendLog(msgText);
           lastLogRef.current = msgText;
         }
-        // The hook will close automatically; keep UI toggle in sync
         setSseEnabled(false);
         close();
       }
       return;
     }
 
-    // Filtered logging
-    const excluded = EXCLUDED_PHASES.has(phase);
-    if (!excluded) {
+    if (!EXCLUDED_PHASES.has(phase)) {
       if (phase === "PROCESS") {
         const now = Date.now();
         if (now - lastProcessLogAtRef.current >= 1500) {
@@ -228,27 +200,72 @@ function DashboardInner() {
     }
   }, [last, appendLog, close]);
 
-  // Reset guards when run changes
   React.useEffect(() => {
     lastProcessLogAtRef.current = 0;
     lastLogRef.current = "";
     terminalSeenRef.current = false;
   }, [safeRunId]);
 
+  const [jobBusy, setJobBusy] = React.useState(false);
+  const canResume = selectedInfo?.status === "CANCELLED" || selectedInfo?.status === "ERROR";
+  const canCancel = selectedInfo?.status === "RUNNING" || selectedInfo?.status === "QUEUED";
+
   const titleRight = React.useMemo(() => {
     if (!selectedInfo) return null;
     return (
-      <div className="flex items-center gap-3 text-sm">
+      <div className="flex items-center gap-2 text-sm">
         <div className="text-slate-400">SSE:</div>
         <div className="text-slate-300">{sseStatus}</div>
-        <div className="text-slate-400">Status:</div>
+        <div className="text-slate-400 ml-3">Status:</div>
         <RunStatusBadge status={selectedInfo.status} />
         {selectedInfo.error && (
           <span className="text-rose-300 truncate max-w-[280px]">— {selectedInfo.error}</span>
         )}
+        {safeRunId && (
+          <>
+            <button
+              className="ml-3 px-2 py-1 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
+              disabled={!canCancel || jobBusy}
+              onClick={async () => {
+                if (!safeRunId) return;
+                setJobBusy(true);
+                try {
+                  await cancelRun(apiBase, safeRunId);
+                  appendLog(`[CANCEL] requested ${safeRunId}`);
+                } catch (e: any) {
+                  appendLog(`[CANCEL] error: ${String(e)}`);
+                } finally {
+                  setJobBusy(false);
+                }
+              }}
+              title="Cancel run"
+            >
+              Cancel run
+            </button>
+            <button
+              className="px-2 py-1 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
+              disabled={!canResume || jobBusy}
+              onClick={async () => {
+                if (!safeRunId) return;
+                setJobBusy(true);
+                try {
+                  await resumeRun(apiBase, safeRunId);
+                  appendLog(`[RESUME] requested ${safeRunId}`);
+                } catch (e: any) {
+                  appendLog(`[RESUME] error: ${String(e)}`);
+                } finally {
+                  setJobBusy(false);
+                }
+              }}
+              title="Resume run"
+            >
+              Resume run
+            </button>
+          </>
+        )}
       </div>
     );
-  }, [selectedInfo, sseStatus]);
+  }, [selectedInfo, sseStatus, apiBase, safeRunId, jobBusy, appendLog]);
 
   return (
     <div className="min-h-[calc(100vh-56px)] p-4">
@@ -317,7 +334,6 @@ function DashboardInner() {
                   onOptionsChange={setViewerOptions}
                   loading={overlayLoading}
                   onRefresh={() => void refreshOverlay({ force: true })}
-                  // NEW: pass the debug-layer image URL down to ViewerPanel -> OverlayCanvas
                   debugImageUrl={debugImageUrl}
                 />
               </div>
@@ -330,6 +346,7 @@ function DashboardInner() {
                   setPaused={setLogPaused}
                   onClear={clearLog}
                   onDownload={downloadLog}
+                  // Wire Pause→cancel run (POST) and Resume→resume run (POST)
                   onPauseCancel={async () => {
                     if (!safeRunId) return;
                     try {
@@ -354,7 +371,7 @@ function DashboardInner() {
           ) : (
             <EmptyState
               title="No run selected"
-              subtitle="Start a new run or choose one from the left."
+              subtitle="Start a new run or choose one to open."
               className="mt-2"
               actionLabel="Start new run"
               onAction={() => {}}
