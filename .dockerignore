@@ -1,0 +1,11 @@
+# Exclude everything from the build context by default
+**
+
+# Allow only what the image build needs
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!src/**
+!frontend/**
+!configs/**
+!export/**
