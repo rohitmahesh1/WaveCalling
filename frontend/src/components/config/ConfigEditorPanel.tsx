@@ -1,7 +1,7 @@
 // components/config/ConfigEditorPanel.tsx
 import * as React from "react";
 import ConfigSections from "@/components/config/ConfigSections";
-import ConfigPanel from "./configPanel";
+import ConfigPanel from "./ConfigPanel";
 import { CONFIG_SECTIONS, type SectionSpec } from "@/utils/configSchema";
 import { useConfigEditor } from "@/hooks/useConfigEditor";
 import { useApiBase } from "@/context/ApiContext";

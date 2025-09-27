@@ -97,7 +97,6 @@ export default function CollapsiblePane({
     : { width: "28px" }; // collapsed rail width
 
   // Minimum inner content width so wide grid rows can scroll instead of clipping.
-  // Tweak if your editor rows get wider.
   const CONTENT_MIN_PX = 560;
 
   return (
