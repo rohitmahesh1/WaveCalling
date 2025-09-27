@@ -1,12 +1,21 @@
+// frontend/src/components/UploadPanel.tsx
 import * as React from "react";
 import { useNavigate } from "react-router-dom";
 import { useApiBase } from "@/context/ApiContext";
 import { useDashboard } from "@/context/DashboardContext";
-import { startRun, cancelRun } from "@/utils/api";
+import { cancelRun } from "@/utils/api";
 import type { RunInfo } from "@/utils/types";
+
+import {
+  startUpload,        // POST /api/uploads/start -> { upload_url, object }
+  uploadResumable,    // PUT file to upload_url
+  startRunFromGcs,    // POST /api/runs/from_gcs with {objects:[...]}
+} from "@/utils/api";
 
 const STORAGE_KEY = "config:overrides";
 const HEIGHT_KEY = "config:overrides:height";
+
+type StagedObj = { object: string; name: string; size?: number };
 
 export default function UploadPanel({
   disabled,
@@ -19,16 +28,19 @@ export default function UploadPanel({
   const apiBase = useApiBase();
   const { selectedRunId, setSelectedRunId, appendLog } = useDashboard();
 
-  // form state
   const fileRef = React.useRef<HTMLInputElement | null>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
+
   const [overrides, setOverrides] = React.useState("");
   const [runName, setRunName] = React.useState("");
   const [verbose, setVerbose] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [startHeight, setStartHeight] = React.useState<number | undefined>(undefined);
 
-  // hydrate overrides + height
+  const [staged, setStaged] = React.useState<StagedObj[]>([]);
+  const stagedCount = staged.length;
+
+  // ---------- persisted UI state ----------
   React.useEffect(() => {
     try {
       const v = window.localStorage.getItem(STORAGE_KEY);
@@ -38,13 +50,11 @@ export default function UploadPanel({
     } catch {}
   }, []);
 
-  // persist on manual edit
   const updateOverrides = React.useCallback((val: string) => {
     setOverrides(val);
     try { window.localStorage.setItem(STORAGE_KEY, val); } catch {}
   }, []);
 
-  // persist height after user drags the native resize handle
   const persistHeight = React.useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -53,16 +63,7 @@ export default function UploadPanel({
     try { window.localStorage.setItem(HEIGHT_KEY, String(h)); } catch {}
   }, []);
 
-  // reflect changes from /config page (cross-tab/window)
-  React.useEffect(() => {
-    function onStorage(e: StorageEvent) {
-      if (e.key === STORAGE_KEY) setOverrides(e.newValue || "");
-    }
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, []);
-
-  // live JSON validation
+  // ---------- JSON validation ----------
   const { jsonError, jsonWarning } = React.useMemo(() => {
     const txt = overrides.trim();
     if (!txt) return { jsonError: null as string | null, jsonWarning: null as string | null };
@@ -78,28 +79,83 @@ export default function UploadPanel({
     }
   }, [overrides]);
 
-  const canSubmit = !disabled && !busy && !jsonError;
+  const canInteract = !disabled && !busy;
+  const canUpload = canInteract && !jsonError;
+  const canStart = canInteract && !jsonError && stagedCount > 0;
 
-  async function onStart(e: React.FormEvent) {
-    e.preventDefault();
+  // ---------- staging to GCS ----------
+  async function stageSelectedToGcs() {
     if (!fileRef.current?.files || fileRef.current.files.length === 0) {
       appendLog("No files selected.");
       return;
     }
-    const fd = new FormData();
-    Array.from(fileRef.current.files).forEach((f) => fd.append("files", f));
-    if (runName.trim()) fd.append("run_name", runName.trim());
-    if (overrides.trim()) fd.append("config_overrides", overrides.trim());
-    if (verbose) fd.append("verbose", "true");
+    setBusy(true);
+    try {
+      const files = Array.from(fileRef.current.files);
+      for (const f of files) {
+        appendLog(`[UPLOAD] preparing ${f.name} (${f.size.toLocaleString()} bytes)`);
+        // 1) ask API for a resumable upload session
+        const { upload_url, object } = await startUpload(apiBase, f);
+        // 2) upload directly to GCS
+        await uploadResumable(upload_url, f);
+        // 3) record the staged object locally
+        setStaged((prev) => [...prev, { object, name: f.name, size: f.size }]);
+        appendLog(`[UPLOAD] done -> gs://${object}`);
+      }
+      // keep file input value (so user can re-upload same filename if desired, optional)
+    } catch (e: any) {
+      appendLog(`[UPLOAD] error: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Stage an already-existing GCS sample (no bytes through Cloud Run)
+  async function stageSampleGcs(filename: "ripple.csv" | "vertical.csv") {
+    if (!canUpload) return;
+    const object = `samples/${filename}`;
+    setStaged((prev) => {
+      if (prev.some((s) => s.object === object)) return prev;
+      return [...prev, { object, name: filename }];
+    });
+    appendLog(`[SAMPLE] staged ${object}`);
+  }
+
+  function clearStaged() {
+    setStaged([]);
+    appendLog("[UPLOADS] cleared staged list (GCS objects remain; bucket lifecycle will clean up).");
+  }
+
+  // ---------- start run ----------
+  async function onStart(e: React.FormEvent) {
+    e.preventDefault();
+    if (!stagedCount) {
+      appendLog("No staged files. Upload or stage a sample first.");
+      return;
+    }
+
+    let parsedOverrides: any = null;
+    if (overrides.trim()) {
+      try { parsedOverrides = JSON.parse(overrides); }
+      catch (err: any) {
+        appendLog(`[RUN] overrides JSON error: ${String(err?.message || err)}`);
+        return;
+      }
+    }
 
     setBusy(true);
     try {
-      const res = await startRun(apiBase, fd);
+      const objects = staged.map((s) => s.object);
+      const res = await startRunFromGcs(apiBase, objects, {
+        runName: runName.trim() || undefined,
+        overrides: parsedOverrides || undefined,
+        verbose,
+      });
       appendLog(`[RUN] started run_id=${res.run_id}`);
       setSelectedRunId(res.run_id);
       onStarted?.(res.run_id, res.info);
       setRunName("");
-      if (fileRef.current) fileRef.current.value = "";
+      setStaged([]);
     } catch (e: any) {
       appendLog(`[RUN] start error: ${String(e)}`);
     } finally {
@@ -146,16 +202,79 @@ export default function UploadPanel({
         </div>
       </div>
 
-      <form onSubmit={onStart} className="mt-3 grid gap-3">
+      {/* Samples (GCS-based) */}
+      <div className="mt-3">
+        <div className="text-sm text-slate-300 mb-1">Quick start with samples</div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            disabled={!canUpload}
+            onClick={() => void stageSampleGcs("ripple.csv")}
+            className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
+          >
+            Stage ripple.csv
+          </button>
+          <button
+            type="button"
+            disabled={!canUpload}
+            onClick={() => void stageSampleGcs("vertical.csv")}
+            className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
+          >
+            Stage vertical.csv
+          </button>
+        </div>
+      </div>
+
+      <form onSubmit={onStart} className="mt-4 grid gap-3">
         <div>
           <label className="block text-sm text-slate-300 mb-1">Files (CSV/XLS/PNG/JPG)</label>
           <input
             ref={fileRef}
             type="file"
             multiple
-            disabled={!canSubmit}
+            disabled={!canUpload}
             className="block w-full text-sm text-slate-300 cursor-pointer file:cursor-pointer file:mr-3 file:px-3 file:py-1.5 file:rounded-md file:border file:border-slate-600 file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700"
           />
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => void stageSelectedToGcs()}
+              disabled={!canUpload}
+              className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
+              title="Uploads go directly to Cloud Storage; run starts later"
+            >
+              Upload (don’t start)
+            </button>
+            <button
+              type="button"
+              onClick={() => void clearStaged()}
+              disabled={!canInteract || stagedCount === 0}
+              className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+              title="Clear staged list (does not delete GCS objects)"
+            >
+              Clear staged
+            </button>
+          </div>
+        </div>
+
+        {/* staged list */}
+        <div className="text-xs text-slate-300">
+          <div className="mb-1">Staged files ({stagedCount}):</div>
+          {stagedCount ? (
+            <ul className="list-disc pl-5 space-y-0.5">
+              {staged.map((s) => (
+                <li key={s.object} className="text-slate-200">
+                  <span className="font-mono">{s.name}</span>
+                  <span className="text-slate-400"> — {s.size?.toLocaleString() ?? "?"} bytes</span>
+                  <span className="ml-2 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-300 border border-slate-600">
+                    GCS: {s.object}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-slate-400">None staged yet. Upload or stage a sample.</div>
+          )}
         </div>
 
         <div>
@@ -165,7 +284,7 @@ export default function UploadPanel({
             value={runName}
             onChange={(e) => setRunName(e.target.value)}
             placeholder="e.g. Test run"
-            disabled={!canSubmit}
+            disabled={!canInteract}
           />
         </div>
 
@@ -204,7 +323,7 @@ export default function UploadPanel({
             spellCheck={false}
             placeholder='{"peaks":{"prominence":4},"kymo":{"onnx":{"thresholds":{"thr_bi":0.17}}}}'
             style={startHeight ? { height: startHeight } as React.CSSProperties : undefined}
-            disabled={!canSubmit && !jsonError /* allow edits even when busy if error present */}
+            disabled={!canInteract && !jsonError}
             aria-invalid={Boolean(jsonError)}
           />
 
@@ -226,7 +345,7 @@ export default function UploadPanel({
             type="checkbox"
             checked={verbose}
             onChange={(e) => setVerbose(e.target.checked)}
-            disabled={!canSubmit}
+            disabled={!canInteract}
           />
           verbose
         </label>
@@ -234,9 +353,9 @@ export default function UploadPanel({
         <div className="flex gap-2">
           <button
             type="submit"
-            disabled={!canSubmit}
+            disabled={!canStart}
             className="px-3 py-1.5 rounded-md border border-slate-600 text-slate-200 hover:bg-slate-800 disabled:opacity-60"
-            title={jsonError ? "Fix JSON errors before starting" : undefined}
+            title={!stagedCount ? "Upload or stage a sample first" : undefined}
           >
             {busy ? "Starting…" : "Start run"}
           </button>
