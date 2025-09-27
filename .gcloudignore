@@ -1,0 +1,14 @@
+# Exclude everything by default
+**
+
+# Re-include exactly what the Dockerfile needs
+!Dockerfile
+!requirements.txt
+!src/**
+!frontend/**
+!configs/**
+!README.md
+!gcs-lifecycle.json
+!files/**
+!configs/**
+!export/**
