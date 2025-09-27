@@ -13,7 +13,7 @@ import numpy as np
 
 def sample_id_from_name(name: str) -> int:
     """Stable small positive int from a sample name."""
-    # stable across runs (python's hash is salted), so use a simple FNV-like hash
+    # simple FNV-like hash
     h = 2166136261
     for ch in name:
         h ^= ord(ch)
