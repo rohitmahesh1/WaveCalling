@@ -1,148 +1,153 @@
 # WaveCalling
 
-A simple toolkit to generate kymograph analyses from CSV or image files, extract wave traces, optionally upload results to Google Sheets, and save summary plots & data locally.
+WaveCalling helps you **turn raw kymographs into quantitative, browsable wave statistics**.  
+It builds on the original KymoButler idea but swaps in a modern, **Python/ONNX** pipeline and a small web app so you can upload images (or tables that auto-convert to heatmaps), run analyses, and explore the results **without touching Mathematica**.
+
+What you get:
+- **Segmentation → skeletonization → crossing-aware tracking → refinement/merging** (ONNX + Python).
+- **Per-track & per-wave metrics** (frequency, period, amplitude, velocity, wavelength) exported to CSV.
+- An **overlay JSON** and viewer to inspect traces, filter by metrics, and open per-track thumbnails/plots.
+- A lightweight **FastAPI** backend that streams **live progress** (Server‑Sent Events) and serves artifacts.
+
+> In-development demo: `waves.rohitmahesh.net` (Cloud Run).
 
 ---
 
-## 📋 Table of Contents
+## Pipelines 
 
-1. [What It Does](#what-it-does)  
-2. [Prerequisites](#prerequisites)  
-3. [Installation](#installation)  
-4. [Setting Up WolframScript](#setting-up-wolframscript)  
-5. [Configuration (Google Sheets)](#configuration-google-sheets)  
-6. [Usage](#usage)  
-7. [Troubleshooting](#troubleshooting)  
+The left diagram shows the original **Mathematica / WL** flow; the right is my **Python / ONNX** re‑implementation.
 
----
-
-## What It Does
-
-- **From CSV**: Converts a CSV of intensity values into a heatmap, runs KymoButler to extract wave traces, fits sinusoids, and outputs:
-  - A summary CSV of wave characteristics  
-  - Histograms of wave lengths & widths  
-  - Individual sine‐regression plots  
-- **From Image**: Preprocesses images via WolframScript, then detects & annotates colored lines, extracts traces, and outputs:
-  - Annotated image  
-  - A summary CSV of line characteristics  
-
-Optional Google Sheets upload if you supply your own `client_secret.json`.
+<table>
+  <tr>
+    <td style="vertical-align:top; width:50%; padding-right:12px;">
+      <strong>Mathematica / WL</strong><br/>
+      <img src="assets/wl_pipeline.svg"
+           alt="WL pipeline" width="90%"
+           style="background:#ffffff; border:1px solid #e5e7eb; padding:4px; border-radius:6px"/>
+    </td>
+    <td style="vertical-align:top; width:70%; padding-left:12px;">
+      <strong>Python / ONNX</strong><br/>
+      <img src="assets/python_pipeline.svg"
+           alt="Python pipeline" width="160%"
+           style="background:#ffffff; border:1px solid #e5e7eb; padding:8px; border-radius:6px;"/>
+    </td>
+  </tr>
+</table>
 
 ---
 
-## Prerequisites
+## Quickstart (one command)
 
-- **Python 3.8+** (Windows or macOS)  
-- **WolframScript** (to run `.wls` scripts)  
-- A **Google account** & a [service OAuth client](https://console.developers.google.com/) if you want Sheets integration
+### 0) Install the basics
+- **Git**  
+  - macOS: usually preinstalled (or run `xcode-select --install`).  
+  - Windows: install Git for Windows.  
+  - Linux: `sudo apt install git` (or your distro’s package manager).
+- **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux). Confirm it works:
+  ```bash
+  docker --version
+  docker compose version
+  ```
+- **GitHub CLI (`gh`)** — needed so we can auto‑download sample data on first run:
+  https://cli.github.com/
 
----
-
-## Installation
-
-### 1. Clone or download this repo
-
+### 1) Get the code
 ```bash
-# Open Terminal (macOS) or PowerShell/Command Prompt (Windows) and run:
 git clone https://github.com/rohitmahesh1/WaveCalling.git
 cd WaveCalling
 ```
 
-### 2. Create & activate a Python virtual environment
-
-<details>
-<summary>macOS / Linux</summary>
-
+### 2) (Optional) Set a session secret
+To isolate runs between browser tabs you can add a secret:
 ```bash
-python3 -m venv waves
-source waves/bin/activate
+python - <<'PY'
+import secrets; print(secrets.token_hex(32))
+PY
+```
+Create a file named `.env` in the repo root and paste:
+```
+SESSION_SECRET=<paste-the-64-hex-string>
 ```
 
-</details>
-
-<details>
-<summary>Windows (PowerShell)</summary>
-
-```powershell
-python -m venv waves
-.\waves\Scripts\activate
-```
-
-</details>
-
-### 3. Install Python dependencies
-
+### 3) Run the app (and fetch samples automatically)
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+make up
+```
+- The **first run** will download example data into `./samples` via the GitHub CLI, then build and start the stack.
+- Open **http://localhost:8080**.  
+- Runs and outputs are persisted to `./runs` on your machine.
+
+**Handy make targets**
+```bash
+make down          # stop the stack
+make rebuild       # rebuild (no cache) + start
+make samples       # (re)download sample assets
+make clean-samples # wipe samples/ (keeps .gitkeep)
 ```
 
 ---
 
-## Setting Up WolframScript
+## Tuning the pipeline (edit `configs/default.yaml`)
 
-1. **Download** the Wolfram Engine (free for development) from  
-   https://www.wolfram.com/engine/  
-2. **Install** and **log in** with your Wolfram ID.  
-3. Ensure `wolframscript` is on your **PATH**:
-   - **macOS**: usually `which wolframscript` → `/usr/local/bin/wolframscript`  
-   - **Windows**: run `wolframscript` in PowerShell; if not found, add its install directory (e.g., `C:\Program Files\Wolfram Research\WolframEngine\12.3\`) to your PATH.
+You control the ML/processing parameters in **`configs/default.yaml`**. Edit locally; changes are picked up on the next start (Compose mounts `./configs:/app/configs:ro`).
+
+> Tip: keep your custom settings in a copy like `configs/my_experiment.yaml` if you want to try variants.
 
 ---
 
-## Configuration (Google Sheets)
+## What’s in the box
 
-1. In the Google Cloud Console, create an **OAuth 2.0 Client ID** (Desktop App).  
-2. Download the JSON (named e.g. `client_secret.json`) and place it in this project’s root folder.  
-3. When you run with `--push_to_drive=True`, the script will look for `client_secret*.json` in the current directory.
+- **Frontend**: React + Vite app (built into the image and served by the API).
+- **API**: FastAPI service with Server‑Sent Events for live progress and simple JSON/static endpoints for artifacts.
+- **Core pipeline**: ONNX KymoButler‑style segmenter + Python tracker and decision module + metrics and overlay composer.
+- **Data & outputs**: Each run writes to `./runs/<run_id>/…` (metrics CSVs, overlay JSON, tracks, debug plots).
 
 ---
 
-## Usage
+## Docker Compose (for reference)
 
-From your activated environment, use:
+You don’t need to edit this to get started — `make up` wraps it for you — but this is the stack under the hood:
 
-```bash
-# Basic CSV processing, save everything locally:
-python run.py "path/to/data.csv"
-
-# Basic image processing:
-python run.py "path/to/image.png"
-
-# Include min trace length (default 30):
-python run.py data.csv --min_trace_length=50
-
-# Upload results to Google Sheets:
-python run.py data.csv --push_to_drive=True
-# (ensure your client_secret*.json is in this folder)
-
-# Combined example:
-python run.py heatmap.csv \
-    --min_trace_length=40 \
-    --push_to_drive=True
+```yaml
+name: waves
+services:
+  api:
+    image: waves-local
+    build:
+      context: .
+      target: backend          # final Python stage from multi-stage Dockerfile
+    container_name: waves-api
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      STORAGE: "local"
+      RUNS_DIR: "/app/runs"
+      DEFAULT_CONFIG: "/app/configs/default.yaml"
+      SAMPLES_DIR: "/app/samples"
+      WEB_DIR: "/app/web"
+      ALLOW_ORIGINS: "http://localhost:8080,http://localhost:5173"
+      ALLOW_CREDENTIALS: "true"
+      SESSION_SECRET: "${SESSION_SECRET:-dev-secret}"   # optional for local
+      SESSION_HTTPS_ONLY: "false"
+      SESSION_SAMESITE: "lax"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./runs:/app/runs
+      - ./configs:/app/configs:ro
+      - ./samples:/app/samples:ro   # sample assets downloaded by the script
+    restart: unless-stopped
 ```
-
-After running, you’ll find:
-
-- **For CSV**:
-  - `heatmap.png` (visual heatmap)  
-  - `kymobutler_output/*.npy` (raw trace arrays)  
-  - `*_wave_data.csv` (wave summary)  
-  - `*_length_distribution.png`, `*_width_distribution.png`  
-
-- **For Image**:
-  - `proc/<image>_processed_2.png`  
-  - `proc/sine_regression/*.png` (per‐line regression)  
-  - `proc/sine_regression/<image>_annotated.png`  
-  - `proc/<image>_line_data.csv`
 
 ---
 
 ## Troubleshooting
 
-- **“command not found: wolframscript”**  
-  Ensure WolframScript is installed and on your system PATH.
-- **Google OAuth browser window won’t open**  
-  Make sure you have a default browser set, or run on a machine with GUI.
-- **Large file errors pushing to GitHub**  
-  Ensure you’ve added `models/` and `waves/` to `.gitignore` and not committed them.
+- **The page loads but I don’t see my run after a refresh**  
+  Your browser session owns the run (cookies). Use the same tab, or set a real `SESSION_SECRET` in `.env` and restart.
+- **CORS errors in the browser console**  
+  For local work, keep `ALLOW_ORIGINS` as shown. 
+- **Nothing on port 8080**  
+  Ensure Docker is running. Then try `make rebuild` or `make down && make up`.
+- **No samples show up**  
+  `make up` downloads them automatically on first run. If `gh` wasn’t installed then, install it and run `make samples`.
