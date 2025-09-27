@@ -2,6 +2,7 @@
 import * as React from "react";
 import { useApiBase } from "@/context/ApiContext";
 import type { OverlayPayload } from "@/utils/types";
+import { getOverlay, isFresh } from "@/utils/api";
 
 const RUN_ID_RE = /^[a-f0-9]{6,32}$/i;
 function sanitizeRunId(v: unknown): string | null {
@@ -46,48 +47,33 @@ export function useOverlay(runId: string | null) {
       lastSigRef.current = "";
       return;
     }
-    setBaseImageUrl(`/runs/${id}/output/base.png`);
-    // Keep previous overlay sticky while new one loads
-  }, [runId]);
+    // FIX: use /files gateway + apiBase
+    setBaseImageUrl(`${apiBase}/files/${id}/output/base.png`);
+    // keep previous overlay sticky while new one loads
+  }, [runId, apiBase]);
 
   const computeSig = (data: OverlayPayload | null) => {
-    if (!data || !Array.isArray(data.tracks)) return "empty";
+    if (!data || !Array.isArray((data as any).tracks)) return "empty";
     let pts = 0;
-    for (const t of data.tracks) pts += Array.isArray(t.poly) ? t.poly.length : 0;
-    return `${data.tracks.length}|${pts}`;
+    for (const t of (data as any).tracks) pts += Array.isArray((t as any).poly) ? t.poly.length : 0;
+    return `${(data as any).tracks.length}|${pts}`;
   };
 
-  // Fetch helper with optional cache-busting
-  const fetchOverlayOnce = React.useCallback(
-    async (id: string, bust: boolean): Promise<Response> => {
-      const u = new URL(`${apiBase}/api/runs/${encodeURIComponent(id)}/overlay`, window.location.origin);
-      if (bust) u.searchParams.set("t", String(Date.now())); // avoid 304 on first/forced load
-      return await fetch(u.toString(), { cache: bust ? "no-store" : "no-cache" });
-    },
-    [apiBase]
-  );
-
   const actuallyFetch = React.useCallback(
-    async (id: string, bust: boolean): Promise<boolean> => {
+    async (id: string, force: boolean): Promise<boolean> => {
       let changed = false;
-      // Only show spinner if nothing rendered yet
+      // only show spinner if nothing rendered yet
       if (!overlay) setOverlayLoading(true);
       try {
-        // First attempt
-        let resp = await fetchOverlayOnce(id, bust);
+        // Use the ETag-aware helper (handles 204/304/aborts internally)
+        const { data, notModified } = await getOverlay(apiBase, id, {
+          key: `GET /api/runs/${id}/overlay`,
+        });
 
-        // If server replies 304 and we don't have an overlay in memory yet,
-        // do a hard refetch with cache-buster to get a 200 + body.
-        if (resp.status === 304 && !overlay) {
-          resp = await fetchOverlayOnce(id, true);
-        }
-
-        if (!resp.ok) {
-          // keep last known overlay on errors
+        // If server said "not modified" or we got nothing new, don't change UI
+        if (notModified || !data) {
           return false;
         }
-
-        const data: OverlayPayload = await resp.json();
 
         const nextSig = computeSig(data);
         const prevSig = lastSigRef.current;
@@ -98,8 +84,9 @@ export function useOverlay(runId: string | null) {
           setOverlay(data);
 
           let pts = 0;
-          for (const t of data.tracks || []) pts += (t.poly?.length || 0);
-          setOverlaySummary({ tracks: data.tracks?.length || 0, points: pts });
+          const tracks = (data as any).tracks || [];
+          for (const t of tracks) pts += (t.poly?.length || 0);
+          setOverlaySummary({ tracks: tracks.length, points: pts });
         }
         return changed;
       } finally {
@@ -107,7 +94,7 @@ export function useOverlay(runId: string | null) {
         lastFetchedAtRef.current = Date.now();
       }
     },
-    [overlay, fetchOverlayOnce]
+    [overlay, apiBase]
   );
 
   const refreshOverlay = React.useCallback(
@@ -128,12 +115,10 @@ export function useOverlay(runId: string | null) {
       const elapsed = now - lastFetchedAtRef.current;
       const force = !!opts?.force;
 
-      // Decide when we must bypass cache:
-      //  - first time (no signature yet) or no overlay in memory
-      //  - explicit force request
-      const mustBust = force || lastSigRef.current === "" || !overlay;
+      // decide when we must fetch immediately
+      const mustFetchNow = force || lastSigRef.current === "" || !overlay;
 
-      if (!force && elapsed < MIN_INTERVAL_MS) {
+      if (!mustFetchNow && elapsed < MIN_INTERVAL_MS) {
         // Coalesce: schedule one trailing fetch after remaining window
         pendingRequestedRef.current = true;
         if (pendingTimerRef.current == null) {
@@ -142,7 +127,7 @@ export function useOverlay(runId: string | null) {
             pendingTimerRef.current = null;
             if (pendingRequestedRef.current) {
               pendingRequestedRef.current = false;
-              inflightRef.current = actuallyFetch(id, mustBust);
+              inflightRef.current = actuallyFetch(id, false);
               try {
                 await inflightRef.current;
               } finally {
@@ -154,7 +139,7 @@ export function useOverlay(runId: string | null) {
         return false;
       }
 
-      const task = actuallyFetch(id, mustBust);
+      const task = actuallyFetch(id, force);
       inflightRef.current = task;
       try {
         return await task;
