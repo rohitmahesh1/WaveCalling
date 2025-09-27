@@ -1,0 +1,39 @@
+name: waves
+services:
+  api:
+    image: waves-local
+    build:
+      context: .
+      target: backend          # final Python stage from multi-stage Dockerfile
+    container_name: waves-api
+    ports:
+      - "${PORT:-8080}:8080"   # host:container
+    environment:
+      # --- Core runtime ---
+      PORT: "8080"                         # uvicorn binds here
+      STORAGE: "local"
+      RUNS_DIR: "/app/runs"
+      DEFAULT_CONFIG: "/app/configs/default.yaml"
+      SAMPLES_DIR: "/app/samples"
+      WEB_DIR: "/app/web"
+
+      # CORS for local dev
+      ALLOW_ORIGINS: "http://localhost:8080,http://localhost:5173"
+      ALLOW_CREDENTIALS: "true"
+
+      # --- Sessions / cookies (dev-safe defaults) ---
+      SESSION_SECRET: "${SESSION_SECRET:-dev-secret}"
+      SESSION_HTTPS_ONLY: "false"
+      SESSION_SAMESITE: "lax"
+
+      LOG_LEVEL: "INFO"
+
+    volumes:
+      # Persist runs on the host so refreshes don’t wipe state
+      - ./runs:/app/runs
+      # Let you edit configs without rebuilding
+      - ./configs:/app/configs:ro
+      # Mount large samples from host (downloaded via fetch_samples.sh)
+      - ./samples:/app/samples:ro
+      # - ./src:/app/src     # uncomment for live code editing (use this in Dev only)
+    restart: unless-stopped
