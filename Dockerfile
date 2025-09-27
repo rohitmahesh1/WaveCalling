@@ -2,31 +2,41 @@
 FROM node:20-alpine AS frontend-build
 WORKDIR /app/frontend
 
-# Install deps and build
+# Install deps and build the SPA
 COPY frontend/package*.json ./
 RUN npm install
 
 COPY frontend/ .
+# The frontend build writes to /app/web (Vite outDir is ../web)
 RUN npm run build
 
 # ---------- Backend runtime ----------
 FROM python:3.12-slim AS backend
-
 WORKDIR /app
 
-# Install python deps
+# Python runtime hygiene
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend code
+# ---- Samples mounted at runtime ----
+RUN mkdir -p /app/samples
+ENV SAMPLES_DIR=/app/samples
+
+# Configs (read-only in compose)
+COPY configs/ ./configs
+ENV DEFAULT_CONFIG=/app/configs/default.yaml
+
+# Backend code and models
 COPY src/ ./src
+COPY export/ ./export
 
-# Copy frontend build into backend's web dir
-COPY --from=frontend-build /app/frontend/dist ./web
-
-# Ensure FastAPI can find the web dir (WEB_DIR=./web)
+# Frontend build output produced at /app/web by the previous stage
+COPY --from=frontend-build /app/web ./web
 ENV WEB_DIR=/app/web
-ENV PYTHONUNBUFFERED=1
 
-EXPOSE 800
+EXPOSE 8080
 CMD ["python", "-m", "src.service.api"]
