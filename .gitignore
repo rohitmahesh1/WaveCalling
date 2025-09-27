@@ -1,4 +1,4 @@
-# virtual‐env
+# virtual-env
 waves/
 
 # models
@@ -26,13 +26,13 @@ data/
 # ignore out/
 out/
 
-# ignore export/
+# ignore export/ 
 export/
 
 # ignore runs/
 runs/
 
-# ignore files/ (temporarily)
+# ignore files/ (old sample location; not used anymore)
 files/
 
 # frontend-related files
@@ -42,3 +42,7 @@ frontend/web
 .DS_Store
 .env.example
 .env
+
+# ---- Samples: keep folder, ignore contents ----
+/samples/*
+!/samples/.gitkeep
