@@ -6,7 +6,6 @@ import type { ViewerOptions } from "@/components/ViewerToolbar";
 export type OverlayCanvasProps = {
   payload: OverlayPayload | null;
   baseImageUrl?: string | null;
-  /** Optional debug layer image URL (e.g., /runs/:id/output/prob.png). */
   debugImageUrl?: string | null;
   options: ViewerOptions;
 
@@ -92,7 +91,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
   const [img, setImg] = React.useState<HTMLImageElement | null>(null);
   const [debugImg, setDebugImg] = React.useState<HTMLImageElement | null>(null);
 
-  // IMPORTANT: treat debugLayer as optional to avoid type mismatches.
   const viewerDebugLayer = (options as any)?.debugLayer as (string | undefined);
 
   // Let parent capture the <canvas> (for downloads, etc.)
@@ -269,7 +267,6 @@ const OverlayCanvas = React.memo(function OverlayCanvasInner({
       maxY = Math.max(maxY, h1, h2);
     }
 
-    // If we truly have nothing (no tracks and no images), show a hint and bail.
     if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
       ctx.fillStyle = "#9aa4bf";
       ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
