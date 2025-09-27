@@ -1,0 +1,31 @@
+%%{init: {
+  "theme": "default",
+  "flowchart": { "htmlLabels": true, "curve": "linear", "nodeSpacing": 40, "rankSpacing": 60 }
+}}%%
+flowchart TB
+  %% Mathematica / WL pipeline
+  WL01["Load kymograph image"]
+  WL02["Convert to grayscale and normalize intensity"]
+  WL03["Invert image if background is bright"]
+  WL04["Apply row-wise normalization (normlines)"]
+
+  WL05{"Classify as unidirectional or bidirectional"}
+  WL06["Unidirectional branch:<br/>run conv net -> two maps (p_ant, p_ret)"]
+  WL07["Combine unidirectional maps by pixelwise maximum"]
+  WL08["Bidirectional branch:<br/>run conv net -> one trackness map"]
+
+  WL09["Threshold probability at 0.20 -> binary mask"]
+  WL10["Morphology: closing, opening, closing (small kernels)"]
+  WL11["Filter components:<br/>size >= 10 pixels and vertical span >= 10 rows"]
+  WL12["Skeletonize to one-pixel width"]
+  WL13["Prune endpoint spurs (~3 passes)"]
+  WL14["Seeding: place seeds at endpoints;<br/>add interior seeds if needed"]
+  WL15["Crossing decisions:<br/>evaluate continuations; select best path (vthr approx 0.50)"]
+  WL16["Enforce one point per time row;<br/>round to integer pixels"]
+  WL17["Deduplicate and resolve overlaps"]
+  WL18["Output: nested list {{{x,y}...}, ...} to stdout"]
+
+  WL01 --> WL02 --> WL03 --> WL04 --> WL05
+  WL05 -- "Unidirectional" --> WL06 --> WL07 --> WL09
+  WL05 -- "Bidirectional"  --> WL08 --> WL09
+  WL09 --> WL10 --> WL11 --> WL12 --> WL13 --> WL14 --> WL15 --> WL16 --> WL17 --> WL18

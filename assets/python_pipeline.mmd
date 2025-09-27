@@ -1,0 +1,44 @@
+%%{init: {
+  "theme": "default",
+  "flowchart": { "htmlLabels": true, "curve": "linear", "nodeSpacing": 40, "rankSpacing": 60 }
+}}%%
+flowchart TB
+  %% Python / ONNX pipeline
+  PY01["Load image"]
+  PY02["Convert to grayscale in [0,1]; normalize intensity"]
+  PY03["Detect bright background; invert if needed"]
+  PY04["Apply row-wise normalization (WL-like)"]
+
+  PY05["Resize to multiple of 16;<br/>tiled ONNX segmentation (tile=256) with Hann blending"]
+  PY06["Probability map over pixels (trackness)"]
+
+  PY07{"Create binary mask"}
+  PY08["Option A: fixed threshold at 0.20"]
+  PY09["Option B: hysteresis thresholding (low=0.10, high=0.20) to link weak pixels"]
+  PY10["Optional auto-threshold sweep to target mask density"]
+
+  PY11["Morphology options:<br/>close-open-close;<br/>optional directional closes;<br/>optional weak-only shave"]
+  PY12["Filter components: min_px=10, min_rows=10"]
+  PY13["Skeletonize to one-pixel width"]
+  PY14["Prune endpoint spurs (~3 passes)"]
+  PY15["Optional junction non-maximum suppression (reduce multi-branch artifacts)"]
+
+  PY16{"Pre-bridge small gaps before tracking?"}
+  PY17["If yes: add short straight bridges under size/probability limits; re-thin"]
+  PY18["If no: skip pre-bridging"]
+
+  PY19["Seeding: start at endpoints; then add interior seeds (two-pass)"]
+  PY20["Crossing resolution:<br/>decision map at junctions; accept branch if score >= 0.50 (top-K mean along preview path)"]
+  PY21["Refine tracks:<br/>extend ends in probability map; merge across small gaps (probability-gated)"]
+  PY22["Postprocess: enforce one point per row; round to integer pixels"]
+  PY23["Deduplicate tracks:<br/>row-overlap IoU and mean delta-x tolerance"]
+  PY24["Output: one .npy per track (kymobutler_output/); optional debug assets"]
+
+  PY01 --> PY02 --> PY03 --> PY04 --> PY05 --> PY06 --> PY07
+  PY07 --> PY08 --> PY11
+  PY07 --> PY09 --> PY11
+  PY07 --> PY10 --> PY11
+  PY11 --> PY12 --> PY13 --> PY14 --> PY15 --> PY16
+  PY16 -- "Yes" --> PY17 --> PY19
+  PY16 -- "No"  --> PY18 --> PY19
+  PY19 --> PY20 --> PY21 --> PY22 --> PY23 --> PY24
