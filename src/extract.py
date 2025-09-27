@@ -19,7 +19,6 @@ from .visualize import (
 # I/O for tables → heatmaps
 from .io.table_to_heatmap import table_to_heatmap
 
-# NEW: features (wave & peak row builders, ids, etc.)
 from .features import (
     build_wave_rows,
     build_peak_rows,
@@ -124,7 +123,6 @@ def process_track(
         period_frac_for_fit=float((features_cfg or {}).get("fit_window_period_frac", 0.5)),
     )
 
-    # NEW: per-peak rows (anchored sine fit around EACH detected peak)
     peak_rows = build_peak_rows(
         x=x, y=y, residual=residual,
         peaks_idx=peaks_idx, peak_props=props,
@@ -267,7 +265,6 @@ def _build_kymo_runner(cfg, log, verbose):
     comp_min_px   = int(comp.get('min_px', 5))
     comp_min_rows = int(comp.get('min_rows', 5))
 
-    # --- NEW: skeleton guardrails & clamps ---
     skel = onnx_cfg.get('skeleton', {}) or {}
     keep_ratio = float(skel.get('keep_ratio', 0.60))
     keep_min_px = int(skel.get('keep_min_px', 2000))
@@ -356,7 +353,6 @@ def _build_kymo_runner(cfg, log, verbose):
         dedupe_overlap_iou=dedupe_overlap_iou,
         dedupe_dx_tol=dedupe_dx_tol,
 
-        # debug (NEW)
         debug_save_images=debug_save_images,
     )
     return _runner, kwargs, 'onnx'
