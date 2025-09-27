@@ -13,7 +13,6 @@ type Props = {
   onCancel: () => void;
   /** Close when clicking outside (backdrop) */
   closeOnBackdrop?: boolean;
-  /** Optional children appended above the buttons (e.g., extra warnings) */
   children?: React.ReactNode;
 };
 
