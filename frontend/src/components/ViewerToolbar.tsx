@@ -20,7 +20,6 @@ interface Props {
   onRefresh: () => void;
   loading?: boolean;
 
-  /** Optional: show an “Advanced” action if provided */
   onOpenAdvanced?: () => void;
   advancedLabel?: string;
 }

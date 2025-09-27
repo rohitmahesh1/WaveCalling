@@ -9,7 +9,6 @@ import { buildDebugImageUrl } from "@/utils/api";
 interface Props {
   overlay: OverlayPayload | null;
   baseImageUrl?: string | null;
-  /** Optional explicit URL for the selected debug layer image. If omitted, we derive it. */
   debugImageUrl?: string | null;
   summary?: { tracks: number; points: number } | null;
   options: ViewerOptions;
@@ -56,8 +55,6 @@ export default function ViewerPanel({
 
   const hasOverlay = !!overlay && (overlay as any)?.tracks && ((overlay as any).tracks.length || 0) > 0;
 
-  // If a debug image URL is explicitly passed, prefer it.
-  // Otherwise, build it from apiBase + run_id + selected layer.
   const derivedDebugUrl = React.useMemo(() => {
     if (debugImageUrl) return debugImageUrl || undefined;
     const layer = (options as any)?.debugLayer as
@@ -142,8 +139,6 @@ export default function ViewerPanel({
         <OverlayCanvas
           payload={overlay as any}
           baseImageUrl={options.showBase ? baseImageUrl ?? undefined : undefined}
-          // If your OverlayCanvas supports rendering the debug image beneath the tracks,
-          // pass it here. If not, just remove the prop below.
           debugImageUrl={derivedDebugUrl}
           options={options}
           padding={20}
