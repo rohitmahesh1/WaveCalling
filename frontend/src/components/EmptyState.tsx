@@ -6,7 +6,7 @@ type Props = {
   actionLabel?: string;
   onAction?: () => void;
   className?: string;
-  icon?: React.ReactNode; // optional custom icon/emoji
+  icon?: React.ReactNode;
 };
 
 export default function EmptyState({ title, subtitle, actionLabel, onAction, className, icon }: Props) {
