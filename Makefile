@@ -1,11 +1,14 @@
 SHELL := /bin/bash
 
-.PHONY: samples up down rebuild clean-samples
+.PHONY: samples models up down rebuild clean-samples clean-models
 
 samples:
 	bash ./scripts/fetch_samples.sh
 
-up: samples
+models:
+	bash ./scripts/fetch_models.sh
+
+up: samples models
 	docker compose up --build
 
 down:
@@ -19,3 +22,7 @@ rebuild:
 clean-samples:
 	rm -rf samples/*
 	@mkdir -p samples && touch samples/.gitkeep
+
+clean-models:
+	rm -rf export/*
+	@mkdir -p export && touch export/.gitkeep
