@@ -22,17 +22,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Samples mounted at runtime ----
-RUN mkdir -p /app/samples
+# ---- Samples & Models are mounted at runtime ----
+RUN mkdir -p /app/samples /app/export
 ENV SAMPLES_DIR=/app/samples
+
+ENV MODELS_DIR=/app/export
 
 # Configs (read-only in compose)
 COPY configs/ ./configs
 ENV DEFAULT_CONFIG=/app/configs/default.yaml
 
-# Backend code and models
+# Backend code
 COPY src/ ./src
-COPY export/ ./export
 
 # Frontend build output produced at /app/web by the previous stage
 COPY --from=frontend-build /app/web ./web
