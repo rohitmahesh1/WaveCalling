@@ -2,22 +2,27 @@
 set -euo pipefail
 
 # Usage:
-#   bash ./scripts/fetch_models.sh [--repo owner/repo] [--dir path] [--force] [--tag vX.Y.Z] [--patterns "model_*.onnx *.onnx"]
-# This script downloads ONLY model assets (.onnx) from a GitHub Release.
+#   bash ./scripts/fetch_samples.sh [--repo owner/repo] [--dir path] [--force] [--tag vX.Y.Z]
+# Examples:
+#   bash ./scripts/fetch_samples.sh
+#   bash ./scripts/fetch_samples.sh --force
+#   bash ./scripts/fetch_samples.sh --repo rohitmahesh1/WaveCalling --dir samples
+#   bash ./scripts/fetch_samples.sh --tag v0.1.0
 
 REPO="rohitmahesh1/WaveCalling"
-DIR="export"
+DIR="samples"
 FORCE=0
 TAG=""
-MODEL_PATTERNS="model_*.onnx *.onnx"
+
+# Patterns considered "samples" (no .onnx here)
+SAMPLE_PATTERNS="sample_* *.tif *.tiff *.csv *.tsv *.xlsx *.xls *.png *.jpg *.jpeg *.npz *.npy"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)     REPO="$2"; shift 2 ;;
-    --dir)      DIR="$2";  shift 2 ;;
-    --force)    FORCE=1;   shift ;;
-    --tag)      TAG="$2";  shift 2 ;;
-    --patterns) MODEL_PATTERNS="$2"; shift 2 ;;
+    --repo) REPO="$2"; shift 2 ;;
+    --dir)  DIR="$2";  shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --tag) TAG="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -32,20 +37,24 @@ mkdir -p "$DIR"
 if [[ -z "${TAG}" ]]; then
   echo "Checking latest release for $REPO..."
   TAG="$(gh release view --repo "$REPO" --json tagName -q '.tagName' || true)"
-  [[ -z "${TAG}" ]] && { echo "No release found for $REPO."; exit 1; }
+  if [[ -z "${TAG}" ]]; then
+    echo "No release found for $REPO (or not accessible)."; exit 1
+  fi
 fi
 echo "Using release tag: $TAG"
 
 ASSETS="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name' || true)"
-[[ -z "${ASSETS//[$'\t\r\n ']/}" ]] && { echo "No assets found on $TAG."; exit 1; }
+if [[ -z "${ASSETS//[$'\t\r\n ']/}" ]]; then
+  echo "No assets found on release $TAG."; exit 1
+fi
 
-echo "Selecting model assets…"
+echo "Selecting sample assets…"
 SELECTED=""
 while IFS= read -r name; do
   [[ -z "$name" ]] && continue
-  # match against any of the MODEL_PATTERNS
+  # match against any of the sample patterns
   match=0
-  for pat in $MODEL_PATTERNS; do
+  for pat in $SAMPLE_PATTERNS; do
     case "$name" in
       $pat) match=1; break;;
     esac
@@ -53,9 +62,11 @@ while IFS= read -r name; do
   [[ $match -eq 1 ]] && SELECTED+="$name"$'\n'
 done <<< "$ASSETS"
 
-[[ -z "${SELECTED//[$'\t\r\n ']/}" ]] && { echo "No model assets matched patterns."; exit 1; }
+if [[ -z "${SELECTED//[$'\t\r\n ']/}" ]]; then
+  echo "No sample assets matched patterns."; exit 1
+fi
 
-echo "Models to download:"
+echo "Samples to download:"
 printf '  - %s\n' $SELECTED
 
 # Download only missing files unless --force
@@ -73,5 +84,5 @@ while IFS= read -r name; do
     --clobber
 done <<< "$SELECTED"
 
-printf "%s\n" "$TAG" > "$DIR/.models_release_tag"
-echo "Models are ready in '$DIR/'."
+printf "%s\n" "$TAG" > "$DIR/.samples_release_tag"
+echo "Samples are ready in '$DIR/'."
