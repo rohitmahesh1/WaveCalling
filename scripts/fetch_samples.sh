@@ -5,7 +5,7 @@ set -euo pipefail
 #   bash ./scripts/fetch_models.sh [--repo owner/repo] [--dir path] [--force] [--tag vX.Y.Z] [--patterns "model_*.onnx *.onnx"]
 # This script downloads ONLY model assets (.onnx) from a GitHub Release.
 
-REPO="rohitmahesh1/WWaveCalling"  # <- fix to your repo if needed (probably rohitmahesh1/WaveCalling)
+REPO="rohitmahesh1/WaveCalling"
 DIR="export"
 FORCE=0
 TAG=""
