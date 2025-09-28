@@ -35,6 +35,7 @@ services:
       - ./configs:/app/configs:ro
       # Samples & models mounted from host (downloaded via scripts)
       - ./samples:/app/samples:ro
+      - ./samples:/samples:ro
       - ./export:/app/export:ro
       # - ./src:/app/src     # uncomment for live code editing (Dev only)
     restart: unless-stopped
