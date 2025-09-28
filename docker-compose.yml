@@ -33,7 +33,8 @@ services:
       - ./runs:/app/runs
       # Let you edit configs without rebuilding
       - ./configs:/app/configs:ro
-      # Mount large samples from host (downloaded via fetch_samples.sh)
+      # Samples & models mounted from host (downloaded via scripts)
       - ./samples:/app/samples:ro
-      # - ./src:/app/src     # uncomment for live code editing (use this in Dev only)
+      - ./export:/app/export:ro
+      # - ./src:/app/src     # uncomment for live code editing (Dev only)
     restart: unless-stopped
