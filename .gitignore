@@ -8,7 +8,8 @@ models/
 __pycache__/
 
 # credentials & tokens
-*.json
+cors.json
+gcs-lifecycle.json
 token.pickle
 
 # OS / editor
