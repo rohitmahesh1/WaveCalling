@@ -1,5 +1,8 @@
 # WaveCalling
 
+## WATCH THE DEMO!
+[![Watch the demo](https://img.youtube.com/vi/hxHw_VcUBfg/maxresdefault.jpg)](https://www.youtube.com/watch?v=hxHw_VcUBfg)
+
 WaveCalling helps you **turn raw kymographs into quantitative, browsable wave statistics**.  
 It builds on the original KymoButler idea but swaps in a modern, **Python/ONNX** pipeline and a small web app so you can upload images (or tables that auto-convert to heatmaps), run analyses, and explore the results **without touching Mathematica**.
 
